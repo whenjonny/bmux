@@ -2,6 +2,18 @@
 import Foundation
 import os
 
+private func weaLog(_ message: String) {
+    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+    let path = "/tmp/cmux-wea-debug.log"
+    if let handle = FileHandle(forWritingAtPath: path) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        try? handle.close()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+    }
+}
+
 /// Manages the WebSocket connection to WEA/Difft OpenAPI.
 /// Uses pull-based message fetching: sends {cmd:"fetch"} to pull pending messages.
 final class WeaWebSocket: NSObject {
@@ -42,8 +54,8 @@ final class WeaWebSocket: NSObject {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
-        NSLog("[WeaWebSocket] Connecting to wss://openapi.difft.org/v1/websocket appId=\(appId)")
-        NSLog("[WeaWebSocket] Headers: \(signed.httpHeaders)")
+        weaLog("[WeaWebSocket] Connecting to wss://openapi.difft.org/v1/websocket appId=\(appId)")
+        weaLog("[WeaWebSocket] Headers: \(signed.httpHeaders)")
 
         session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         webSocketTask = session?.webSocketTask(with: request)
@@ -155,7 +167,7 @@ extension WeaWebSocket: URLSessionWebSocketDelegate {
         webSocketTask: URLSessionWebSocketTask,
         didOpenWithProtocol protocol: String?
     ) {
-        NSLog("[WeaWebSocket] WebSocket connected")
+        weaLog("[WeaWebSocket] WebSocket connected")
         DispatchQueue.main.async { [weak self] in
             self?.onConnected()
         }
@@ -169,7 +181,7 @@ extension WeaWebSocket: URLSessionWebSocketDelegate {
         reason: Data?
     ) {
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "none"
-        NSLog("[WeaWebSocket] WebSocket closed: code=\(closeCode.rawValue) reason=\(reasonStr)")
+        weaLog("[WeaWebSocket] WebSocket closed: code=\(closeCode.rawValue) reason=\(reasonStr)")
         DispatchQueue.main.async { [weak self] in
             if closeCode.rawValue == 1008 {
                 self?.state = .disconnected
@@ -185,7 +197,7 @@ extension WeaWebSocket: URLSessionWebSocketDelegate {
         didCompleteWithError error: Error?
     ) {
         if let error {
-            NSLog("[WeaWebSocket] Connection failed: \(error.localizedDescription)")
+            weaLog("[WeaWebSocket] Connection failed: \(error.localizedDescription)")
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.onStateChange?(.disconnected)
