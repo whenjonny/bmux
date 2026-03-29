@@ -24,10 +24,11 @@ enum WeaSignature {
         let signature: String
         let signedHeaders: String
 
-        /// Returns a dictionary suitable for setting on a `URLRequest`.
+        /// Returns the X-Signature-* headers for a `URLRequest`.
+        /// Note: Content-Type is NOT included here — callers (e.g. WeaHttpClient)
+        /// set it separately for POST requests. WebSocket upgrade must NOT have it.
         var httpHeaders: [String: String] {
             [
-                "Content-Type": "application/json;charset=utf-8",
                 "X-Signature-appid": appId,
                 "X-Signature-timestamp": timestamp,
                 "X-Signature-nonce": nonce,
