@@ -2518,18 +2518,20 @@ class TabManager: ObservableObject {
 
     // MARK: - Surface Directory Updates (Backwards Compatibility)
 
-    func updateSurfaceDirectory(tabId: UUID, surfaceId: UUID, directory: String) {
+    func updateSurfaceDirectory(tabId: UUID, surfaceId: UUID, directory: String, skipGitRefresh: Bool = false) {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
         let previousDirectory = gitProbeDirectory(for: tab, panelId: surfaceId)
         let normalized = normalizeDirectory(directory)
         tab.updatePanelDirectory(panelId: surfaceId, directory: normalized)
-        let nextDirectory = normalizedWorkingDirectory(normalized)
-        if previousDirectory != nextDirectory {
-            scheduleWorkspaceGitMetadataRefreshIfPossible(
-                workspaceId: tabId,
-                panelId: surfaceId,
-                reason: "directoryChange"
-            )
+        if !skipGitRefresh {
+            let nextDirectory = normalizedWorkingDirectory(normalized)
+            if previousDirectory != nextDirectory {
+                scheduleWorkspaceGitMetadataRefreshIfPossible(
+                    workspaceId: tabId,
+                    panelId: surfaceId,
+                    reason: "directoryChange"
+                )
+            }
         }
     }
 
@@ -2537,32 +2539,37 @@ class TabManager: ObservableObject {
         tabId: UUID,
         surfaceId: UUID,
         branch: String,
-        isDirty: Bool
+        isDirty: Bool,
+        skipGitRefresh: Bool = false
     ) {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
         let current = tab.panelGitBranches[surfaceId]
         let normalizedBranch = Self.normalizedBranchName(branch) ?? branch
         guard current?.branch != normalizedBranch || current?.isDirty != isDirty else { return }
         tab.updatePanelGitBranch(panelId: surfaceId, branch: normalizedBranch, isDirty: isDirty)
-        scheduleWorkspaceGitMetadataRefreshIfPossible(
-            workspaceId: tabId,
-            panelId: surfaceId,
-            reason: "branchChange"
-        )
+        if !skipGitRefresh {
+            scheduleWorkspaceGitMetadataRefreshIfPossible(
+                workspaceId: tabId,
+                panelId: surfaceId,
+                reason: "branchChange"
+            )
+        }
     }
 
-    func clearSurfaceGitBranch(tabId: UUID, surfaceId: UUID) {
+    func clearSurfaceGitBranch(tabId: UUID, surfaceId: UUID, skipGitRefresh: Bool = false) {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
         let hadBranch = tab.panelGitBranches[surfaceId] != nil
         let hadPullRequest = tab.panelPullRequests[surfaceId] != nil
         guard hadBranch || hadPullRequest else { return }
         tab.clearPanelGitBranch(panelId: surfaceId)
         tab.clearPanelPullRequest(panelId: surfaceId)
-        scheduleWorkspaceGitMetadataRefreshIfPossible(
-            workspaceId: tabId,
-            panelId: surfaceId,
-            reason: "branchCleared"
-        )
+        if !skipGitRefresh {
+            scheduleWorkspaceGitMetadataRefreshIfPossible(
+                workspaceId: tabId,
+                panelId: surfaceId,
+                reason: "branchCleared"
+            )
+        }
     }
 
     func updateSurfaceShellActivity(
@@ -2713,18 +2720,20 @@ class TabManager: ObservableObject {
     @discardableResult
     func closeWorkspaceWithConfirmation(_ workspace: Workspace) -> Bool {
         // WEA workspace requires disconnect confirmation
-        if workspace.title == "wea" && WeaBotService.shared.isRunning {
+        if workspace.weaGroupId != nil {
             guard confirmClose(
-                title: String(localized: "weaBot.close.title", defaultValue: "Disconnect WEA Bot?"),
+                title: String(localized: "weaBot.closeChat.title", defaultValue: "Close WEA Chat?"),
                 message: String(
-                    localized: "weaBot.close.message",
-                    defaultValue: "Closing this workspace will disconnect the WEA bot. All group chat sessions will be terminated."
+                    localized: "weaBot.closeChat.message",
+                    defaultValue: "Closing this workspace will terminate the WEA chat session."
                 ),
                 acceptCmdD: tabs.count <= 1
             ) else {
                 return false
             }
-            WeaBotService.shared.stop()
+            if let groupId = workspace.weaGroupId {
+                WeaBotService.shared.removeBridge(for: "group:\(groupId)")
+            }
             closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
             return true
         }
@@ -3082,7 +3091,12 @@ class TabManager: ObservableObject {
 
         // Child-exit on the last panel should collapse the workspace, matching explicit close
         // semantics (and close the window when it was the last workspace).
+        // WEA workspaces are exempt — the bot session may restart or the user may inspect output.
         if tab.panels.count <= 1 {
+            if tab.weaGroupId != nil {
+                WeaBotService.shared.handleChildExited(workspaceId: tab.id.uuidString)
+                return
+            }
             if tabs.count <= 1 {
                 if let app = AppDelegate.shared {
                     app.notificationStore?.clearNotifications(forTabId: tabId)

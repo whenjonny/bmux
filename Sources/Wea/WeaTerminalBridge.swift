@@ -27,15 +27,20 @@ final class WeaTerminalBridge {
 
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaTerminalBridge")
     let sessionKey: String              // "direct:{wuid}" or "group:{groupId}"
-    private weak var panel: TerminalPanel?
+    private let panel: TerminalPanel
+    let panelId: UUID
     private let httpClient: WeaHttpClient
     private let dest: WeaMessageDest
+    private let launcherCommands: [String]
 
     private(set) var state: State = .idle
+    private(set) var processAlive: Bool = true
     private var activeCardId: String?
     private var pendingMessages: [String] = []
     private var replReady = false
-    private var readyCheckTimer: Timer?
+    private var startupTimeoutTask: Task<Void, Never>?
+    private var startupRetryCount = 0
+    private let startupTimeoutSeconds: UInt64 = 25
 
     /// Set by WeaBotService when a WEA message is being injected.
     /// Claude Code hooks check this to know if the current prompt is from WEA.
@@ -44,57 +49,91 @@ final class WeaTerminalBridge {
     /// Flag file used by hooks to detect WEA-originated prompts.
     nonisolated let weaActiveMarkerPath: String
 
-    init(sessionKey: String, panel: TerminalPanel, httpClient: WeaHttpClient, dest: WeaMessageDest) {
+    init(
+        sessionKey: String,
+        panel: TerminalPanel,
+        httpClient: WeaHttpClient,
+        dest: WeaMessageDest,
+        launcherCommands: [String]
+    ) {
         self.sessionKey = sessionKey
         self.panel = panel
+        self.panelId = panel.id
         self.httpClient = httpClient
         self.dest = dest
+        self.launcherCommands = launcherCommands
         let safe = sessionKey.replacingOccurrences(of: ":", with: "_")
         self.weaActiveMarkerPath = "\(NSTemporaryDirectory())cmux-wea-active-\(safe)"
 
-        // Start checking if the REPL is ready
-        startReadyCheck()
+        // Wait for an explicit Claude session-start hook; if startup stalls, retry once.
+        scheduleStartupTimeout()
     }
 
     deinit {
-        readyCheckTimer?.invalidate()
+        startupTimeoutTask?.cancel()
         try? FileManager.default.removeItem(atPath: weaActiveMarkerPath)
     }
 
-    // MARK: - REPL Ready Detection
+    // MARK: - REPL Startup Handling
 
-    /// Periodically check if the Claude REPL is ready to accept input.
-    /// We consider it ready after a delay from panel creation (Claude CLI startup time).
-    private func startReadyCheck() {
-        // Give Claude CLI time to start up (auth, model selection, REPL init)
-        // Check every 2 seconds, mark ready after 15 seconds or when we detect activity
-        var elapsed: TimeInterval = 0
-        let checkInterval: TimeInterval = 2.0
-        let maxWait: TimeInterval = 20.0
-
-        readyCheckTimer = Timer.scheduledTimer(withTimeInterval: checkInterval, repeats: true) { [weak self] timer in
-            guard let self else { timer.invalidate(); return }
-            elapsed += checkInterval
-
-            if elapsed >= maxWait {
-                timer.invalidate()
-                self.readyCheckTimer = nil
-                self.markReady()
-            }
+    private func scheduleStartupTimeout() {
+        startupTimeoutTask?.cancel()
+        startupTimeoutTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: startupTimeoutSeconds * 1_000_000_000)
+            await self.handleStartupTimeoutIfNeeded()
         }
+    }
+
+    private func handleStartupTimeoutIfNeeded() async {
+        guard !replReady else { return }
+        guard !Task.isCancelled else { return }
+
+        if startupRetryCount < launcherCommands.count {
+            let command = launcherCommands[startupRetryCount]
+            startupRetryCount += 1
+            weaLog("[Bridge:\(sessionKey)] Claude session-start timeout, retrying launch (\(startupRetryCount)/\(launcherCommands.count))")
+            weaLog("[Bridge:\(sessionKey)] Retry launcher command: \(command)")
+            panel.sendInput(command + "\n")
+            scheduleStartupTimeout()
+            return
+        }
+
+        weaLog("[Bridge:\(sessionKey)] Claude failed to initialize (no session-start hook)")
+        await failPendingStartup()
+    }
+
+    private func failPendingStartup() async {
+        let message = "Claude initialization failed in this workspace. Please check codemax/claude auth and startup."
+        do {
+            if let cardId = activeCardId {
+                try await httpClient.refreshCard(cardId: cardId, content: message, dest: dest)
+            } else if !pendingMessages.isEmpty {
+                try await httpClient.sendReply(text: message, dest: dest)
+            }
+        } catch {
+            logger.error("Failed to send startup failure message to WEA: \(error.localizedDescription)")
+        }
+
+        // Keep pending messages so a late SessionStart can still flush and reply.
+        // We only notify the user about startup delay/failure here.
+        state = .idle
+        activeCardId = nil
+        cleanupMarker()
     }
 
     private func markReady() {
         guard !replReady else { return }
         replReady = true
+        startupTimeoutTask?.cancel()
+        startupTimeoutTask = nil
         weaLog("[Bridge:\(sessionKey)] REPL marked as ready, pending=\(pendingMessages.count)")
 
         // Flush pending messages
+        guard state != .processing, state != .waitingInput else { return }
         if let first = pendingMessages.first {
             pendingMessages.removeFirst()
-            Task {
-                await doInjectMessage(first)
-            }
+            Task { await doInjectMessage(first) }
         }
     }
 
@@ -117,11 +156,6 @@ final class WeaTerminalBridge {
     }
 
     private func doInjectMessage(_ text: String) async {
-        guard let panel else {
-            logger.warning("Panel is nil for session \(self.sessionKey)")
-            return
-        }
-
         state = .processing
         writeMarker()
         weaLog("[Bridge:\(sessionKey)] Injecting message: \(text.prefix(100))")
@@ -199,20 +233,32 @@ final class WeaTerminalBridge {
 
     /// Called when a WEA user replies to a question.
     func injectQuestionReply(_ reply: String) {
-        guard state == .waitingInput, let panel else { return }
+        guard state == .waitingInput else { return }
         state = .processing
         panel.sendInput(reply + "\n")
     }
 
     /// Called by claude-hook when SessionStart fires.
-    func startTranscriptWatch(path: String) {
-        weaLog("[Bridge:\(sessionKey)] Transcript: \(path)")
-        // If we haven't marked ready yet, mark now (Claude session started = REPL is ready)
-        if !replReady {
-            readyCheckTimer?.invalidate()
-            readyCheckTimer = nil
-            markReady()
+    func startTranscriptWatch(path: String?) {
+        if let path, !path.isEmpty {
+            weaLog("[Bridge:\(sessionKey)] Transcript: \(path)")
+        } else {
+            weaLog("[Bridge:\(sessionKey)] SessionStart received without transcript path")
         }
+        // SessionStart is the authoritative readiness signal.
+        markReady()
+    }
+
+    // MARK: - Process Liveness
+
+    /// Called when the terminal's child process exits (PTY closed).
+    func markProcessExited() {
+        processAlive = false
+        replReady = false
+        startupTimeoutTask?.cancel()
+        startupTimeoutTask = nil
+        cleanupMarker()
+        weaLog("[Bridge:\(sessionKey)] Process exited, bridge marked dead")
     }
 
     // MARK: - Finish & Queue

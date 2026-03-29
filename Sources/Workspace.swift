@@ -5434,6 +5434,8 @@ final class Workspace: Identifiable, ObservableObject {
     @Published var customTitle: String?
     @Published var isPinned: Bool = false
     @Published var customColor: String?  // hex string, e.g. "#C0392B"
+    /// Non-nil if this workspace is a WEA chat session. Stores the WEA group/DM ID.
+    var weaGroupId: String?
     @Published var currentDirectory: String
     private(set) var preferredBrowserProfileID: UUID?
 
@@ -7551,6 +7553,7 @@ final class Workspace: Identifiable, ObservableObject {
         inPane paneId: PaneID,
         focus: Bool? = nil,
         workingDirectory: String? = nil,
+        initialCommand: String? = nil,
         startupEnvironment: [String: String] = [:]
     ) -> TerminalPanel? {
         let shouldFocusNewTab = focus ?? (bonsplitController.focusedPaneId == paneId)
@@ -7558,7 +7561,7 @@ final class Workspace: Identifiable, ObservableObject {
         let previousHostedView = focusedTerminalPanel?.hostedView
 
         let inheritedConfig = inheritedTerminalConfig(inPane: paneId)
-        let remoteTerminalStartupCommand = remoteTerminalStartupCommand()
+        let remoteTerminalStartupCommand = initialCommand ?? remoteTerminalStartupCommand()
 
         // Create new terminal panel
         let newPanel = TerminalPanel(

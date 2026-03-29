@@ -2,8 +2,6 @@
 import Foundation
 import os
 
-/// Central orchestrator for WEA bot functionality.
-/// Manages the WebSocket connection, routes messages, creates/manages terminal bridges.
 @MainActor
 final class WeaBotService: ObservableObject {
     static let shared = WeaBotService()
@@ -18,17 +16,14 @@ final class WeaBotService: ObservableObject {
 
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaBotService")
     private let webSocket = WeaWebSocket()
+    private let registry = WeaSessionRegistry()
     private var httpClient: WeaHttpClient?
     private var workspaceManager: WeaWorkspaceManager?
 
     @Published private(set) var state: ServiceState = .stopped
-    private var bridges: [String: WeaTerminalBridge] = [:]  // sessionKey → bridge
+    private var bridges: [String: WeaTerminalBridge] = [:]
+    private var workspaceSessionKeys: [String: String] = [:]  // workspace UUID string -> sessionKey
 
-    /// Callback to create a new group chat tab. Set by the UI layer.
-    var onCreateGroupTab: ((_ groupId: String, _ groupName: String) -> TerminalPanel?)?
-    /// Callback to get the main DM tab's panel.
-    var onGetMainPanel: (() -> TerminalPanel?)?
-    /// Reference to the TabManager for workspace management.
     weak var tabManager: TabManager?
 
     private init() {
@@ -43,11 +38,10 @@ final class WeaBotService: ObservableObject {
                 switch wsState {
                 case .connected:
                     self.state = .running
-                    self.createWeaWorkspaceIfNeeded()
                 case .connecting: self.state = .connecting
                 case .reconnecting: self.state = .reconnecting
                 case .disconnected:
-                    if case .error = self.state { /* keep error state */ } else {
+                    if case .error = self.state {} else {
                         self.state = .stopped
                     }
                 }
@@ -64,6 +58,10 @@ final class WeaBotService: ObservableObject {
             return
         }
 
+        if let tabManager {
+            workspaceManager = WeaWorkspaceManager(tabManager: tabManager)
+        }
+
         httpClient = WeaHttpClient(appId: config.appId, appSecret: secret, botId: config.botId)
         state = .connecting
         webSocket.connect(appId: config.appId, appSecret: secret)
@@ -72,19 +70,12 @@ final class WeaBotService: ObservableObject {
     func stop() {
         webSocket.disconnect()
         bridges.removeAll()
+        workspaceSessionKeys.removeAll()
+        registry.removeAll()
         httpClient = nil
-        workspaceManager?.destroyWeaWorkspace()
+        workspaceManager?.closeAllWeaWorkspaces()
         workspaceManager = nil
         state = .stopped
-    }
-
-    /// Creates the "wea" sidebar workspace with a Claude session when first connected.
-    private func createWeaWorkspaceIfNeeded() {
-        guard let tabManager, workspaceManager == nil else { return }
-        let manager = WeaWorkspaceManager(tabManager: tabManager)
-        manager.createWeaWorkspace()
-        workspaceManager = manager
-        logger.info("Auto-created wea workspace on connect")
     }
 
     // MARK: - Message Routing
@@ -95,7 +86,6 @@ final class WeaBotService: ObservableObject {
         do {
             message = try WeaMessageParser.parse(payload, botId: config.botId)
         } catch {
-            // Skip unparseable messages (RECEIPT, RECALL, etc.)
             return
         }
 
@@ -109,35 +99,48 @@ final class WeaBotService: ObservableObject {
 
     private func routeDirectMessage(_ message: WeaParsedMessage) {
         let sessionKey = "direct:\(message.senderWuid)"
-        routeToSession(sessionKey: sessionKey, message: message)
+        let displayName = message.senderName ?? "DM"
+        routeToSession(sessionKey: sessionKey, groupId: message.senderWuid, displayName: displayName, message: message)
     }
 
     private func routeGroupMessage(_ message: WeaParsedMessage) {
         guard let groupId = message.groupId else { return }
         let config = WeaBotConfig.shared
 
-        // Check blacklist
         guard !config.isBlacklisted(groupId) else { return }
-
-        // Only process if bot is mentioned
         guard message.isMentionBot else { return }
 
-        // Track known groups
         if let name = message.senderName, !name.isEmpty {
             config.knownGroups[groupId] = name
         }
 
         let sessionKey = "group:\(groupId)"
-        routeToSession(sessionKey: sessionKey, message: message)
+        let displayName = config.knownGroups[groupId] ?? "Group"
+        routeToSession(sessionKey: sessionKey, groupId: groupId, displayName: displayName, message: message)
     }
 
-    private func routeToSession(sessionKey: String, message: WeaParsedMessage) {
+    private func routeToSession(sessionKey: String, groupId: String, displayName: String, message: WeaParsedMessage) {
         let bridge: WeaTerminalBridge
 
         if let existing = bridges[sessionKey] {
-            bridge = existing
+            // Recreate if terminal panel is gone OR Claude process exited.
+            let panelLive = workspaceManager?.hasLiveTerminalPanel(groupId: groupId, panelId: existing.panelId) == true
+            if panelLive && existing.processAlive {
+                bridge = existing
+            } else {
+                logger.info("Recreating bridge for \(sessionKey): panelLive=\(panelLive) processAlive=\(existing.processAlive)")
+                bridges.removeValue(forKey: sessionKey)
+                registry.markDead(sessionKey: sessionKey)
+                if let newBridge = createBridge(sessionKey: sessionKey, groupId: groupId, displayName: displayName, message: message) {
+                    bridge = newBridge
+                    bridges[sessionKey] = bridge
+                } else {
+                    logger.error("Failed to recreate bridge for session \(sessionKey)")
+                    return
+                }
+            }
         } else {
-            guard let newBridge = createBridge(sessionKey: sessionKey, message: message) else {
+            guard let newBridge = createBridge(sessionKey: sessionKey, groupId: groupId, displayName: displayName, message: message) else {
                 logger.error("Failed to create bridge for session \(sessionKey)")
                 return
             }
@@ -145,7 +148,8 @@ final class WeaBotService: ObservableObject {
             bridges[sessionKey] = bridge
         }
 
-        // If bridge is waiting for input (question reply), treat this as a reply
+        registry.touchMessage(sessionKey: sessionKey)
+
         if bridge.state == .waitingInput {
             bridge.injectQuestionReply(message.text)
         } else {
@@ -155,76 +159,88 @@ final class WeaBotService: ObservableObject {
         }
     }
 
-    private func createBridge(sessionKey: String, message: WeaParsedMessage) -> WeaTerminalBridge? {
-        guard let httpClient else { return nil }
+    private func createBridge(sessionKey: String, groupId: String, displayName: String, message: WeaParsedMessage) -> WeaTerminalBridge? {
+        guard let httpClient, let workspaceManager else { return nil }
         let dest = WeaMessageParser.replyDest(for: message)
-        let panel: TerminalPanel?
 
-        if message.chatType == .directMessage {
-            panel = onGetMainPanel?()
-        } else {
-            let groupName = message.senderName ?? message.groupId ?? "Group"
-            panel = onCreateGroupTab?(message.groupId!, groupName)
+        guard let panel = workspaceManager.findOrCreatePanel(groupId: groupId, displayName: displayName) else {
+            return nil
         }
 
-        guard let panel else { return nil }
+        workspaceSessionKeys[panel.workspaceId.uuidString.lowercased()] = sessionKey
+        registry.register(sessionKey: sessionKey, groupId: groupId, displayName: displayName)
+
         return WeaTerminalBridge(
             sessionKey: sessionKey,
             panel: panel,
             httpClient: httpClient,
-            dest: dest
+            dest: dest,
+            launcherCommands: workspaceManager.claudeRetryCommands(for: groupId)
         )
     }
 
     // MARK: - Hook Integration
 
-    /// Called by claude-hook handler when Stop fires on a WEA session.
     func handleClaudeStop(workspaceId: String, transcriptPath: String?, lastMessage: String?) {
-        for bridge in bridges.values {
-            guard bridge.isWeaMessageActive else { continue }
-            Task {
-                await bridge.onClaudeStop(transcriptPath: transcriptPath, lastMessage: lastMessage)
-            }
+        if let bridge = bridge(forWorkspaceId: workspaceId) {
+            Task { await bridge.onClaudeStop(transcriptPath: transcriptPath, lastMessage: lastMessage) }
+            return
+        }
+        for bridge in bridges.values where bridge.isWeaMessageActive {
+            Task { await bridge.onClaudeStop(transcriptPath: transcriptPath, lastMessage: lastMessage) }
             return
         }
     }
 
-    /// Called by claude-hook handler when Notification fires.
     func handleClaudeNotification(workspaceId: String, question: String) {
-        for bridge in bridges.values {
-            guard bridge.isWeaMessageActive else { continue }
-            Task {
-                await bridge.onNeedsInput(question: question)
-            }
+        if let bridge = bridge(forWorkspaceId: workspaceId) {
+            Task { await bridge.onNeedsInput(question: question) }
+            return
+        }
+        for bridge in bridges.values where bridge.isWeaMessageActive {
+            Task { await bridge.onNeedsInput(question: question) }
             return
         }
     }
 
-    /// Called by claude-hook when PreToolUse(AskUserQuestion) fires.
     func handleAskUserQuestion(workspaceId: String, questionText: String) {
-        for bridge in bridges.values {
-            guard bridge.isWeaMessageActive else { continue }
-            Task {
-                await bridge.onAskUserQuestion(questionText: questionText)
-            }
+        if let bridge = bridge(forWorkspaceId: workspaceId) {
+            Task { await bridge.onAskUserQuestion(questionText: questionText) }
+            return
+        }
+        for bridge in bridges.values where bridge.isWeaMessageActive {
+            Task { await bridge.onAskUserQuestion(questionText: questionText) }
             return
         }
     }
 
-    /// Called by claude-hook when SessionStart fires (to begin transcript watch).
     func handleSessionStart(workspaceId: String, transcriptPath: String?) {
-        guard let transcriptPath else { return }
-        for bridge in bridges.values {
-            guard bridge.isWeaMessageActive else { continue }
+        if let bridge = bridge(forWorkspaceId: workspaceId) {
             bridge.startTranscriptWatch(path: transcriptPath)
             return
         }
+        for bridge in bridges.values where bridge.isWeaMessageActive {
+            bridge.startTranscriptWatch(path: transcriptPath)
+            return
+        }
+    }
+
+    // MARK: - Process Lifecycle
+
+    /// Called by TabManager when a WEA terminal's child process exits.
+    func handleChildExited(workspaceId: String) {
+        guard let bridge = bridge(forWorkspaceId: workspaceId) else { return }
+        logger.info("Child process exited for session \(bridge.sessionKey)")
+        bridge.markProcessExited()
+        registry.markDead(sessionKey: bridge.sessionKey)
     }
 
     // MARK: - Session Management
 
     func removeBridge(for sessionKey: String) {
         bridges.removeValue(forKey: sessionKey)
+        workspaceSessionKeys = workspaceSessionKeys.filter { $0.value != sessionKey }
+        registry.unregister(sessionKey: sessionKey)
     }
 
     func bridge(for sessionKey: String) -> WeaTerminalBridge? {
@@ -233,8 +249,16 @@ final class WeaBotService: ObservableObject {
 
     var isRunning: Bool { state == .running }
 
-    /// Called by WeaWebSocket when the connection fails with an error.
     func reportConnectionError(_ message: String) {
         state = .error(message)
+    }
+
+    private func bridge(forWorkspaceId workspaceId: String) -> WeaTerminalBridge? {
+        let normalized = workspaceId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty,
+              let sessionKey = workspaceSessionKeys[normalized] else {
+            return nil
+        }
+        return bridges[sessionKey]
     }
 }

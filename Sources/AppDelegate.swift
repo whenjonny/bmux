@@ -2407,6 +2407,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         installShortcutMonitor()
         installShortcutDefaultsObserver()
         NSApp.servicesProvider = self
+
+        // Auto-connect WEA bot if configured
+        if !isRunningUnderXCTest {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                let config = WeaBotConfig.shared
+                if config.autoConnect && config.isConfigured {
+                    if let tabManager = self?.tabManager {
+                        WeaBotService.shared.tabManager = tabManager
+                    }
+                    WeaBotService.shared.start()
+                }
+            }
+        }
+
 #if DEBUG
         UpdateTestSupport.applyIfNeeded(to: updateController.viewModel)
         if env["CMUX_UI_TEST_MODE"] == "1" {
@@ -9731,14 +9745,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             event: event,
             shortcut: KeyboardShortcutSettings.shortcut(for: .selectWorkspaceByNumber)
         ) {
-            if let manager = tabManager,
-               let targetIndex = WorkspaceShortcutMapper.workspaceIndex(forDigit: digit, workspaceCount: manager.tabs.count) {
+            if let manager = tabManager {
+                // Only count normal (non-WEA) workspaces for digit shortcuts
+                let normalTabs = manager.tabs.filter { $0.weaGroupId == nil }
+                if let normalIndex = WorkspaceShortcutMapper.workspaceIndex(forDigit: digit, workspaceCount: normalTabs.count),
+                   normalIndex < normalTabs.count {
+                    let targetWorkspace = normalTabs[normalIndex]
+                    if let fullIndex = manager.tabs.firstIndex(where: { $0.id == targetWorkspace.id }) {
 #if DEBUG
-                dlog(
-                    "shortcut.action name=workspaceDigit digit=\(digit) targetIndex=\(targetIndex) manager=\(debugManagerToken(manager)) \(debugShortcutRouteSnapshot(event: event))"
-                )
+                        dlog(
+                            "shortcut.action name=workspaceDigit digit=\(digit) normalIndex=\(normalIndex) fullIndex=\(fullIndex) manager=\(debugManagerToken(manager)) \(debugShortcutRouteSnapshot(event: event))"
+                        )
 #endif
-                manager.selectTab(at: targetIndex)
+                        manager.selectTab(at: fullIndex)
+                    }
+                }
             }
             return true
         }

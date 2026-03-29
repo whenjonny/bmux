@@ -11,6 +11,7 @@ final class WeaBotConfig: ObservableObject {
     private static let autoConnectKey = "weaBot.autoConnect"
     private static let groupBlacklistKey = "weaBot.groupBlacklist"
     private static let knownGroupsKey = "weaBot.knownGroups"
+    private static let sessionsRootPathKey = "weaBot.sessionsRootPath"
     private static let keychainService = "com.cmuxterm.app.wea-bot"
     private static let keychainAccount = "app-secret"
 
@@ -33,6 +34,9 @@ final class WeaBotConfig: ObservableObject {
             }
         }
     }
+    @Published var sessionsRootPath: String {
+        didSet { UserDefaults.standard.set(sessionsRootPath, forKey: Self.sessionsRootPathKey) }
+    }
 
     var isConfigured: Bool {
         !appId.isEmpty && !botId.isEmpty && loadSecret() != nil
@@ -47,6 +51,7 @@ final class WeaBotConfig: ObservableObject {
            let groups = try? JSONDecoder().decode([String: String].self, from: data) {
             self.knownGroups = groups
         }
+        self.sessionsRootPath = UserDefaults.standard.string(forKey: Self.sessionsRootPathKey) ?? ""
     }
 
     // MARK: - Keychain (app secret)
@@ -98,5 +103,22 @@ final class WeaBotConfig: ObservableObject {
 
     func isBlacklisted(_ groupId: String) -> Bool {
         groupBlacklist.contains(groupId)
+    }
+
+    /// Resolved sessions root path. Falls back to `{cwd}/wea-sessions` if empty.
+    var resolvedSessionsRootPath: String {
+        let path = sessionsRootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty {
+            return (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent("wea-sessions")
+        }
+        return path
+    }
+
+    /// Creates and returns the session folder for a given group ID.
+    func sessionFolder(for groupId: String) -> String {
+        let root = resolvedSessionsRootPath
+        let folder = (root as NSString).appendingPathComponent(groupId)
+        try? FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        return folder
     }
 }

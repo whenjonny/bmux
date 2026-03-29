@@ -2,97 +2,142 @@
 import Foundation
 import os
 
-/// Manages the wea workspace and its tabs.
-/// Creates workspace on connect, destroys on disconnect, spawns group chat tabs.
+/// Manages WEA chat workspaces.
+/// Each WEA group/DM gets its own independent Workspace with a dedicated session folder.
 @MainActor
 final class WeaWorkspaceManager {
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaWorkspaceManager")
     private weak var tabManager: TabManager?
-    private var weaWorkspace: Workspace?
-    private var groupPanels: [String: UUID] = [:]  // groupId → panelId
 
     init(tabManager: TabManager) {
         self.tabManager = tabManager
-        setupCallbacks()
     }
 
-    private func setupCallbacks() {
-        let service = WeaBotService.shared
-        service.tabManager = tabManager
+    // MARK: - Workspace Lookup & Creation
 
-        service.onGetMainPanel = { [weak self] in
-            self?.getMainPanel()
-        }
-
-        service.onCreateGroupTab = { [weak self] groupId, groupName in
-            self?.createGroupTab(groupId: groupId, groupName: groupName)
-        }
+    /// Find the existing workspace for a group ID, or nil.
+    func workspace(for groupId: String) -> Workspace? {
+        tabManager?.tabs.first { $0.weaGroupId == groupId }
     }
 
-    // MARK: - Workspace Lifecycle
+    /// Whether a specific terminal panel is still alive in the session workspace.
+    func hasLiveTerminalPanel(groupId: String, panelId: UUID) -> Bool {
+        guard let workspace = workspace(for: groupId),
+              let panel = workspace.panels[panelId] as? TerminalPanel else {
+            return false
+        }
+        return panel.workspaceId == workspace.id
+    }
 
-    func createWeaWorkspace() {
-        guard let tabManager else { return }
+    /// Build the WEA Claude launch plan:
+    /// 1) Prefer codemax claude for user intent.
+    /// 2) If startup hook is missing, retry with plain claude wrapper so hooks are guaranteed.
+    private func resolveClaudeLaunchPlan(workingDirectory: String) -> (initialCommand: String, retryCommands: [String]) {
+        let directScript = "exec claude --allow-dangerously-skip-permissions --model=bedrock-claude-4-6-opus"
+
+        let codemaxCandidates = [
+            "\(NSHomeDirectory())/.local/bin/codemax",
+            "/usr/local/bin/codemax"
+        ]
+        for path in codemaxCandidates where FileManager.default.isExecutableFile(atPath: path) {
+            let codemax = shellSingleQuote(path)
+            let codemaxScript = "exec \(codemax) claude --allow-dangerously-skip-permissions --model=bedrock-claude-4-6-opus"
+            return (
+                initialCommand: makeShellLaunchCommand(codemaxScript, workingDirectory: workingDirectory),
+                retryCommands: [makeShellLaunchCommand(directScript, workingDirectory: workingDirectory)]
+            )
+        }
+
+        // No codemax found: start and retry with plain claude wrapper command.
+        let directCommand = makeShellLaunchCommand(directScript, workingDirectory: workingDirectory)
+        return (initialCommand: directCommand, retryCommands: [])
+    }
+
+    private func makeShellLaunchCommand(_ launchScript: String, workingDirectory: String) -> String {
+        var script = launchScript
+        // Ensure cmux's bundled bin directory stays first on PATH so codemax
+        // resolves `claude` to cmux's wrapper (which injects WEA hooks).
+        if let cmuxBinDir = bundledCmuxBinDirectory() {
+            let quotedDir = shellSingleQuote(cmuxBinDir)
+            script = "export PATH=\(quotedDir):\"$PATH\"; " + script
+        }
+        let quotedCwd = shellSingleQuote(workingDirectory)
+        script = "cd \(quotedCwd) || exit 1; " + script
+        // Wrap in login shell so the full user environment is available.
+        // Use exec so the shell process becomes the claude process (clean signal forwarding).
+        let userShell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        return "\(userShell) -l -c \(shellSingleQuote(script))"
+    }
+
+    /// Retry commands for WEA startup fallback, in order.
+    func claudeRetryCommands(for groupId: String) -> [String] {
+        let folder = WeaBotConfig.shared.sessionFolder(for: groupId)
+        return resolveClaudeLaunchPlan(workingDirectory: folder).retryCommands
+    }
+
+    /// Find or create a workspace for a group/DM session.
+    /// Returns the terminal panel for message injection.
+    func findOrCreatePanel(groupId: String, displayName: String) -> TerminalPanel? {
+        let folder = WeaBotConfig.shared.sessionFolder(for: groupId)
+        let launchPlan = resolveClaudeLaunchPlan(workingDirectory: folder)
+
+        // Check for existing workspace
+        if let existing = workspace(for: groupId) {
+            if let existingPanel = existing.panels.values.compactMap({ $0 as? TerminalPanel }).first {
+                return existingPanel
+            }
+            // Workspace exists but terminal was closed. Recreate a new terminal panel.
+            guard let paneId = existing.bonsplitController.focusedPaneId ?? existing.bonsplitController.allPaneIds.first,
+                  let newPanel = existing.newTerminalSurface(inPane: paneId, focus: false, workingDirectory: folder, initialCommand: launchPlan.initialCommand) else {
+                return nil
+            }
+            logger.info("Recreated WEA terminal panel for \(groupId) in existing workspace \(existing.id.uuidString)")
+            return newPanel
+        }
+
+        // Create workspace
+        guard let tabManager else { return nil }
         let workspace = tabManager.addWorkspace(
-            title: "wea",
-            initialTerminalCommand: "codemax claude --allow-dangerously-skip-permissions --model=bedrock-claude-4-6-opus",
-            select: true
+            title: displayName,
+            workingDirectory: folder,
+            initialTerminalCommand: launchPlan.initialCommand,
+            select: false,
+            eagerLoadTerminal: true
         )
-        weaWorkspace = workspace
-        logger.info("Created wea workspace: \(workspace.id)")
+        workspace.weaGroupId = groupId
+        logger.info("Created WEA workspace '\(displayName)' for \(groupId) at \(folder)")
+        logger.info("WEA launch command for \(groupId): \(launchPlan.initialCommand)")
+
+        return workspace.panels.values.compactMap({ $0 as? TerminalPanel }).first
     }
 
-    func destroyWeaWorkspace() {
-        guard let workspace = weaWorkspace, let tabManager else { return }
-        tabManager.closeWorkspaceWithConfirmation(workspace)
-        weaWorkspace = nil
-        groupPanels.removeAll()
-        logger.info("Destroyed wea workspace")
-    }
+    // MARK: - Cleanup
 
-    // MARK: - Panel Access
-
-    private func getMainPanel() -> TerminalPanel? {
-        guard let workspace = weaWorkspace else { return nil }
-        // The first terminal panel in the workspace is the "main" DM tab
-        return workspace.panels.values.compactMap { $0 as? TerminalPanel }.first
-    }
-
-    private func createGroupTab(groupId: String, groupName: String) -> TerminalPanel? {
-        guard let workspace = weaWorkspace else { return nil }
-
-        // Check if we already have a panel for this group
-        if let existingPanelId = groupPanels[groupId],
-           let existing = workspace.panels[existingPanelId] as? TerminalPanel {
-            return existing
+    /// Close all WEA workspaces (called on disconnect).
+    func closeAllWeaWorkspaces() {
+        guard let tabManager else { return }
+        let weaWorkspaces = tabManager.tabs.filter { $0.weaGroupId != nil }
+        for workspace in weaWorkspaces {
+            tabManager.closeWorkspace(workspace)
         }
-
-        // Create a new terminal in the focused pane (adds as a tab)
-        guard let paneId = workspace.bonsplitController.focusedPaneId else { return nil }
-        guard let newPanel = workspace.newTerminalSurface(
-            inPane: paneId,
-            focus: false
-        ) else { return nil }
-
-        // Run Claude in the new tab too
-        newPanel.sendInput("codemax claude --allow-dangerously-skip-permissions --model=bedrock-claude-4-6-opus\n")
-
-        groupPanels[groupId] = newPanel.id
-        logger.info("Created group tab '\(groupName)' for \(groupId)")
-        return newPanel
+        logger.info("Closed \(weaWorkspaces.count) WEA workspaces")
     }
 
-    // MARK: - Queries
-
-    var hasWeaWorkspace: Bool { weaWorkspace != nil }
-
-    /// Check if a workspace is the WEA workspace
-    func isWeaWorkspace(_ workspace: Workspace) -> Bool {
-        workspace.id == weaWorkspace?.id
+    /// Close workspace for a specific group.
+    func closeWorkspace(for groupId: String) {
+        guard let tabManager, let workspace = workspace(for: groupId) else { return }
+        tabManager.closeWorkspace(workspace)
     }
 
-    /// Get the group ID for a panel, if it's a WEA group tab
-    func groupIdForPanel(_ panelId: UUID) -> String? {
-        groupPanels.first { $0.value == panelId }?.key
+    private func shellSingleQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func bundledCmuxBinDirectory() -> String? {
+        guard let resourcePath = Bundle.main.resourcePath else { return nil }
+        let binDir = (resourcePath as NSString).appendingPathComponent("bin")
+        let cmuxPath = (binDir as NSString).appendingPathComponent("cmux")
+        guard FileManager.default.isExecutableFile(atPath: cmuxPath) else { return nil }
+        return binDir
     }
 }

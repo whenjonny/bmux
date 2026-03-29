@@ -65,8 +65,10 @@ typeset -g _CMUX_GIT_HEAD_LAST_PWD=""
 typeset -g _CMUX_GIT_HEAD_PATH=""
 typeset -g _CMUX_GIT_HEAD_SIGNATURE=""
 typeset -g _CMUX_GIT_HEAD_WATCH_PID=""
+typeset -g _CMUX_GIT_WORKTREE_ROOT=""
 typeset -g _CMUX_PR_POLL_PID=""
 typeset -g _CMUX_PR_POLL_PWD=""
+typeset -g _CMUX_PR_POLL_REPO_ROOT=""
 typeset -g _CMUX_PR_POLL_INTERVAL=45
 typeset -g _CMUX_PR_FORCE=0
 typeset -g _CMUX_ASYNC_JOB_TIMEOUT=20
@@ -313,6 +315,20 @@ _cmux_git_resolve_head_path() {
                 print -r -- "$gitdir/HEAD"
                 return 0
             fi
+        fi
+        [[ "$dir" == "/" || -z "$dir" ]] && break
+        dir="${dir:h}"
+    done
+    return 1
+}
+
+_cmux_git_worktree_root() {
+    # Return the directory containing .git (file or dir) — the work-tree root.
+    local dir="$PWD"
+    while true; do
+        if [[ -d "$dir/.git" || -f "$dir/.git" ]]; then
+            print -r -- "$dir"
+            return 0
         fi
         [[ "$dir" == "/" || -z "$dir" ]] && break
         dir="${dir:h}"
@@ -604,6 +620,7 @@ _cmux_start_pr_poll_loop() {
 
     _cmux_stop_pr_poll_loop
     _CMUX_PR_POLL_PWD="$watch_pwd"
+    _CMUX_PR_POLL_REPO_ROOT="$_CMUX_GIT_WORKTREE_ROOT"
 
     {
         while true; do
@@ -746,6 +763,7 @@ _cmux_precmd() {
         _CMUX_GIT_HEAD_LAST_PWD="$pwd"
         _CMUX_GIT_HEAD_PATH="$(_cmux_git_resolve_head_path 2>/dev/null || true)"
         _CMUX_GIT_HEAD_SIGNATURE=""
+        _CMUX_GIT_WORKTREE_ROOT="$(_cmux_git_worktree_root 2>/dev/null || true)"
     fi
     if [[ -n "$_CMUX_GIT_HEAD_PATH" ]]; then
         local head_signature
@@ -811,12 +829,23 @@ _cmux_precmd() {
     # appear even without another prompt.
     local should_restart_pr_poll=0
     local pr_context_changed=0
-    if [[ -n "$_CMUX_PR_POLL_PWD" && "$pwd" != "$_CMUX_PR_POLL_PWD" ]]; then
+    # Use the git worktree root to detect repo changes instead of raw pwd.
+    # This avoids restarting the PR poll on every `cd` within the same repo.
+    local repo_changed=0
+    if [[ -n "$_CMUX_GIT_WORKTREE_ROOT" ]]; then
+        [[ "$_CMUX_GIT_WORKTREE_ROOT" != "$_CMUX_PR_POLL_REPO_ROOT" ]] && repo_changed=1
+    elif [[ -n "$_CMUX_PR_POLL_REPO_ROOT" ]]; then
+        # Moved from a git repo to a non-git directory
+        repo_changed=1
+    fi
+    if (( repo_changed )); then
         pr_context_changed=1
     elif (( git_head_changed )); then
         pr_context_changed=1
     fi
-    if [[ "$pwd" != "$_CMUX_PR_POLL_PWD" ]]; then
+    if (( repo_changed )); then
+        should_restart_pr_poll=1
+    elif (( git_head_changed )); then
         should_restart_pr_poll=1
     elif (( _CMUX_PR_FORCE )); then
         should_restart_pr_poll=1

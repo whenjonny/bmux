@@ -8546,7 +8546,9 @@ struct VerticalTabsSidebar: View {
     }
 
     var body: some View {
-        let workspaceCount = tabManager.tabs.count
+        let normalTabs = tabManager.tabs.filter { $0.weaGroupId == nil }
+        let weaTabs = tabManager.tabs.filter { $0.weaGroupId != nil }
+        let workspaceCount = normalTabs.count
         let canCloseWorkspace = workspaceCount > 1
         let workspaceNumberShortcut = self.workspaceNumberShortcut
 
@@ -8559,7 +8561,9 @@ struct VerticalTabsSidebar: View {
                             .frame(height: trafficLightPadding)
 
                         LazyVStack(spacing: tabRowSpacing) {
-                            ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
+                            // MARK: - Normal workspaces
+                            ForEach(Array(normalTabs.enumerated()), id: \.element.id) { normalIndex, tab in
+                                let fullIndex = tabManager.tabs.firstIndex(where: { $0.id == tab.id }) ?? normalIndex
                                 let selectedContextIds: Set<UUID> = selectedTabIds.contains(tab.id) ? selectedTabIds : [tab.id]
                                 let contextTargetIds = tabManager.tabs.compactMap { workspace in
                                     selectedContextIds.contains(workspace.id) ? workspace.id : nil
@@ -8571,13 +8575,80 @@ struct VerticalTabsSidebar: View {
                                     tabManager: tabManager,
                                     notificationStore: notificationStore,
                                     tab: tab,
-                                    index: index,
+                                    index: fullIndex,
                                     isActive: tabManager.selectedTabId == tab.id,
                                     workspaceShortcutDigit: WorkspaceShortcutMapper.digitForWorkspace(
-                                        at: index,
+                                        at: normalIndex,
                                         workspaceCount: workspaceCount
                                     ),
                                     workspaceShortcutModifierSymbol: workspaceNumberShortcut.modifierDisplayString,
+                                    canCloseWorkspace: canCloseWorkspace,
+                                    accessibilityWorkspaceCount: workspaceCount,
+                                    unreadCount: notificationStore.unreadCount(forTabId: tab.id),
+                                    latestNotificationText: {
+                                        guard showsSidebarNotificationMessage,
+                                              let notification = notificationStore.latestNotification(forTabId: tab.id) else {
+                                            return nil
+                                        }
+                                        let text = notification.body.isEmpty ? notification.title : notification.body
+                                        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        return trimmed.isEmpty ? nil : trimmed
+                                    }(),
+                                    rowSpacing: tabRowSpacing,
+                                    setSelectionToTabs: { selection = .tabs },
+                                    selectedTabIds: $selectedTabIds,
+                                    lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+                                    showsModifierShortcutHints: modifierKeyMonitor.isModifierPressed,
+                                    dragAutoScrollController: dragAutoScrollController,
+                                    draggedTabId: $draggedTabId,
+                                    dropIndicator: $dropIndicator,
+                                    remoteContextMenuWorkspaceIds: remoteContextMenuTargets.map(\.id),
+                                    allRemoteContextMenuTargetsConnecting: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .connecting },
+                                    allRemoteContextMenuTargetsDisconnected: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .disconnected }
+                                )
+                                .equatable()
+                            }
+
+                            // MARK: - WEA section divider + header
+                            if !weaTabs.isEmpty {
+                                VStack(spacing: 0) {
+                                    Divider()
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 6)
+
+                                    HStack(spacing: 6) {
+                                        Text("WEA")
+                                            .font(.caption)
+                                            .fontWeight(.semibold)
+                                            .foregroundColor(.secondary)
+                                        Circle()
+                                            .fill(WeaBotService.shared.isRunning ? Color.green : Color.gray)
+                                            .frame(width: 6, height: 6)
+                                        Spacer()
+                                    }
+                                    .padding(.horizontal, 16)
+                                    .padding(.bottom, 4)
+                                }
+                            }
+
+                            // MARK: - WEA workspaces
+                            ForEach(Array(weaTabs.enumerated()), id: \.element.id) { weaIndex, tab in
+                                let fullIndex = tabManager.tabs.firstIndex(where: { $0.id == tab.id }) ?? weaIndex
+                                let selectedContextIds: Set<UUID> = selectedTabIds.contains(tab.id) ? selectedTabIds : [tab.id]
+                                let contextTargetIds = tabManager.tabs.compactMap { workspace in
+                                    selectedContextIds.contains(workspace.id) ? workspace.id : nil
+                                }
+                                let remoteContextMenuTargets = tabManager.tabs.filter { workspace in
+                                    contextTargetIds.contains(workspace.id) && workspace.isRemoteWorkspace
+                                }
+                                TabItemView(
+                                    tabManager: tabManager,
+                                    notificationStore: notificationStore,
+                                    tab: tab,
+                                    index: fullIndex,
+                                    isActive: tabManager.selectedTabId == tab.id,
+                                    workspaceShortcutDigit: nil,
+                                    workspaceShortcutModifierSymbol: "",
                                     canCloseWorkspace: canCloseWorkspace,
                                     accessibilityWorkspaceCount: workspaceCount,
                                     unreadCount: notificationStore.unreadCount(forTabId: tab.id),
@@ -11817,11 +11888,11 @@ private struct TabItemView: View, Equatable {
         }
         .disabled(targetIds.isEmpty)
 
-        // WEA Bot workspace actions
-        if tab.title == "wea" && WeaBotService.shared.isRunning {
+        // WEA chat workspace actions
+        if let groupId = tab.weaGroupId {
             Divider()
-            Button(String(localized: "contextMenu.disconnectWeaBot", defaultValue: "Disconnect WEA Bot")) {
-                WeaBotService.shared.stop()
+            Button(String(localized: "contextMenu.closeWeaChat", defaultValue: "Close WEA Chat")) {
+                WeaBotService.shared.removeBridge(for: "group:\(groupId)")
             }
         }
 

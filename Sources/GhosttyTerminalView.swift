@@ -536,6 +536,17 @@ func resolveTerminalOpenURLTarget(_ rawValue: String) -> TerminalOpenURLTarget? 
         return .external(parsed)
     }
 
+    // Detect relative file paths matched by Ghostty's URL regex (e.g.
+    // "team/space-config.json", "./foo.txt", "../bar", "~/notes.md").
+    // These must not fall through to resolveBrowserNavigableURL which
+    // would incorrectly prepend "https://".
+    if looksLikeRelativeFilePath(trimmed) {
+        #if DEBUG
+        dlog("link.resolve result=external(relativePath) input=\(trimmed)")
+        #endif
+        return .external(URL(fileURLWithPath: trimmed, isDirectory: false))
+    }
+
     if let webURL = resolveBrowserNavigableURL(trimmed) {
         guard BrowserInsecureHTTPSettings.normalizeHost(webURL.host ?? "") != nil else {
             #if DEBUG
@@ -559,6 +570,40 @@ func resolveTerminalOpenURLTarget(_ rawValue: String) -> TerminalOpenURLTarget? 
     dlog("link.resolve result=external(fallback) url=\(fallback)")
     #endif
     return .external(fallback)
+}
+
+/// Returns `true` when the string looks like a relative file path rather than
+/// a bare hostname or search term.  Matches the same shapes that Ghostty's
+/// URL regex (Branch 2 & 3 in `url.zig`) emits for non-absolute paths:
+///   ./foo   ../foo   ~/foo   .config/foo   word/file.ext
+private func looksLikeRelativeFilePath(_ s: String) -> Bool {
+    if s.contains("://") { return false }
+
+    // Dot-relative, parent-relative, home-relative, or env-var prefix
+    if s.hasPrefix("./") || s.hasPrefix("../") || s.hasPrefix("~/") || s.hasPrefix("$") {
+        return true
+    }
+    // Dotfile directory prefix (e.g. ".config/ghostty")
+    if s.hasPrefix("."), s.contains("/") {
+        return true
+    }
+
+    guard let slashIdx = s.firstIndex(of: "/") else { return false }
+
+    // The first path segment (before the first slash).
+    let firstSegment = s[s.startIndex..<slashIdx]
+
+    // If the first segment contains a dot it looks like a domain name
+    // (e.g. "google.com/search", "foo.io/bar") — not a file path.
+    if firstSegment.contains(".") { return false }
+
+    // Bare relative path: first segment is a plain directory name and
+    // the remainder contains a dot (file extension), e.g.
+    // "team/space-config.json", "src/config/url.zig:42".
+    let afterSlash = s[s.index(after: slashIdx)...]
+    if afterSlash.contains(".") { return true }
+
+    return false
 }
 
 enum TerminalKeyboardCopyModeSelectionMove: String, Equatable {

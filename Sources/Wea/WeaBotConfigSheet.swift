@@ -1,4 +1,5 @@
 // Sources/Wea/WeaBotConfigSheet.swift
+import AppKit
 import SwiftUI
 
 /// Configuration sheet for the WEA Bot connection settings.
@@ -61,6 +62,36 @@ struct WeaBotConfigSheet: View {
                     ) {
                         Toggle("", isOn: $config.autoConnect)
                             .labelsHidden()
+                    }
+
+                    Divider()
+
+                    fieldRow(
+                        label: String(localized: "weaBot.config.sessionsRoot", defaultValue: "Sessions Folder")
+                    ) {
+                        HStack(spacing: 4) {
+                            TextField(
+                                "",
+                                text: $config.sessionsRootPath,
+                                prompt: Text(config.resolvedSessionsRootPath)
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 180)
+
+                            Button {
+                                let panel = NSOpenPanel()
+                                panel.canChooseDirectories = true
+                                panel.canChooseFiles = false
+                                panel.canCreateDirectories = true
+                                panel.allowsMultipleSelection = false
+                                if panel.runModal() == .OK, let url = panel.url {
+                                    config.sessionsRootPath = url.path
+                                }
+                            } label: {
+                                Image(systemName: "folder")
+                            }
+                            .buttonStyle(.borderless)
+                        }
                     }
                 }
             }

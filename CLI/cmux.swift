@@ -11124,6 +11124,15 @@ struct CMUXCLI {
                     client: client
                 )
             }
+            // SessionStart is required for WEA startup readiness.
+            // Do not gate this on the active-marker file: marker files are only
+            // created when a WEA prompt is injected, but startup readiness is
+            // determined before the first prompt is injected.
+            var weaSessionStartPayload: [String: Any] = ["workspace_id": workspaceId]
+            if let tp = parsedInput.transcriptPath, !tp.isEmpty {
+                weaSessionStartPayload["transcript_path"] = tp
+            }
+            sendWeaHookCommand("wea_session_start", payload: weaSessionStartPayload, client: client)
             print("OK")
 
         case "stop", "idle":
@@ -11166,6 +11175,14 @@ struct CMUXCLI {
                     let body = sanitizeNotificationField(completion.body)
                     let payload = "\(title)|\(subtitle)|\(body)"
                     _ = try? sendV1Command("notify_target \(workspaceId) \(surfaceId) \(payload)", client: client)
+                }
+
+                // Notify WeaBotService so it can send the reply back to WEA
+                if hasWeaActiveMarker() {
+                    var weaPayload: [String: Any] = ["workspace_id": workspaceId]
+                    if let tp = parsedInput.transcriptPath { weaPayload["transcript_path"] = tp }
+                    if let body = completion?.body { weaPayload["last_message"] = body }
+                    sendWeaHookCommand("wea_claude_stop", payload: weaPayload, client: client)
                 }
 
                 try? setClaudeStatus(
@@ -11242,6 +11259,14 @@ struct CMUXCLI {
                 )
             }
 
+            // Forward notification to WEA if this is a WEA-originated session
+            if hasWeaActiveMarker() {
+                sendWeaHookCommand("wea_claude_notification", payload: [
+                    "workspace_id": workspaceId,
+                    "question": summary.body
+                ], client: client)
+            }
+
             let response = try client.send(command: "notify_target \(workspaceId) \(surfaceId) \(payload)")
             _ = try? setClaudeStatus(
                 client: client,
@@ -11316,6 +11341,13 @@ struct CMUXCLI {
                     lastSubtitle: "Waiting",
                     lastBody: question
                 )
+                // Forward AskUserQuestion to WEA if this is a WEA-originated session
+                if hasWeaActiveMarker() {
+                    sendWeaHookCommand("wea_ask_question", payload: [
+                        "workspace_id": workspaceId,
+                        "question": question
+                    ], client: client)
+                }
                 // Don't clear notifications or set status here.
                 // The Notification hook fires right after and will use the saved question.
                 print("OK")
@@ -11887,6 +11919,20 @@ struct CMUXCLI {
         guard value.count > maxLength else { return value }
         let index = value.index(value.startIndex, offsetBy: max(0, maxLength - 1))
         return String(value[..<index]) + "…"
+    }
+
+    /// Check if any WEA session is active (marker file exists in tmp dir).
+    private func hasWeaActiveMarker() -> Bool {
+        let tmpDir = NSTemporaryDirectory()
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: tmpDir)) ?? []
+        return contents.contains { $0.hasPrefix("cmux-wea-active-") }
+    }
+
+    /// Send a WEA hook command with a JSON payload to the socket.
+    private func sendWeaHookCommand(_ command: String, payload: [String: Any], client: SocketClient) {
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+              let jsonStr = String(data: jsonData, encoding: .utf8) else { return }
+        _ = try? sendV1Command("\(command) \(jsonStr)", client: client)
     }
 
     private func sanitizeNotificationField(_ value: String) -> String {

@@ -1,6 +1,7 @@
 import AppKit
 import Bonsplit
 import Combine
+import MarkdownUI
 import SwiftUI
 
 final class NonDraggableHostingView<Content: View>: NSHostingView<Content> {
@@ -159,6 +160,785 @@ final class AnchorNSView: NSView {
     }
 }
 
+private struct CronJobConfigEntry: Identifiable, Equatable {
+    let id: UUID
+    var name: String
+    var cron: String
+    var enabled: Bool
+    var action: String
+    var notify: String
+
+    init(
+        id: UUID = UUID(),
+        name: String = "",
+        cron: String = "*/5 * * * *",
+        enabled: Bool = true,
+        action: String = "",
+        notify: String = ""
+    ) {
+        self.id = id
+        self.name = name
+        self.cron = cron
+        self.enabled = enabled
+        self.action = action
+        self.notify = notify
+    }
+}
+
+private struct CronActionBehaviorEntry: Identifiable, Equatable {
+    let id: UUID
+    var name: String
+    var command: String
+    var enabled: Bool
+    var notify: String
+
+    init(
+        id: UUID = UUID(),
+        name: String = "",
+        command: String = "",
+        enabled: Bool = true,
+        notify: String = ""
+    ) {
+        self.id = id
+        self.name = name
+        self.command = command
+        self.enabled = enabled
+        self.notify = notify
+    }
+}
+
+private struct CronJobFile: Identifiable, Equatable {
+    let id: UUID
+    let fileName: String
+    let filePath: String
+    let fileURL: URL
+    var jobs: [CronJobConfigEntry]
+    var actions: [CronActionBehaviorEntry]
+    var rawMarkdown: String
+
+    init(
+        id: UUID = UUID(),
+        fileName: String,
+        filePath: String,
+        fileURL: URL,
+        jobs: [CronJobConfigEntry] = [],
+        actions: [CronActionBehaviorEntry] = [],
+        rawMarkdown: String = ""
+    ) {
+        self.id = id
+        self.fileName = fileName
+        self.filePath = filePath
+        self.fileURL = fileURL
+        self.jobs = jobs
+        self.actions = actions
+        self.rawMarkdown = rawMarkdown
+    }
+}
+
+// MARK: - CronJobMarkdownStore
+
+private enum CronJobMarkdownStore {
+    enum StoreError: LocalizedError {
+        case appSupportUnavailable
+
+        var errorDescription: String? {
+            switch self {
+            case .appSupportUnavailable:
+                return String(
+                    localized: "cronjob.store.appSupportUnavailable",
+                    defaultValue: "Unable to resolve Application Support directory."
+                )
+            }
+        }
+    }
+
+    static func jobsDirectoryURL(fileManager: FileManager = .default) throws -> URL {
+        guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw StoreError.appSupportUnavailable
+        }
+        return appSupport
+            .appendingPathComponent("cmux", isDirectory: true)
+            .appendingPathComponent("jobs", isDirectory: true)
+    }
+
+    private static func legacyFileURL(fileManager: FileManager = .default) throws -> URL {
+        guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw StoreError.appSupportUnavailable
+        }
+        return appSupport
+            .appendingPathComponent("cmux", isDirectory: true)
+            .appendingPathComponent("job.md", isDirectory: false)
+    }
+
+    // MARK: - Load all job files from the jobs/ directory
+
+    static func loadAll(fileManager: FileManager = .default) throws -> (files: [CronJobFile], directoryPath: String) {
+        let dirURL = try jobsDirectoryURL(fileManager: fileManager)
+
+        // Migration: if old job.md exists and jobs/ does not, migrate
+        if !fileManager.fileExists(atPath: dirURL.path) {
+            let legacyURL = try legacyFileURL(fileManager: fileManager)
+            if fileManager.fileExists(atPath: legacyURL.path) {
+                try migrateFromLegacy(legacyURL: legacyURL, dirURL: dirURL, fileManager: fileManager)
+            } else {
+                try seedDefaultJobFiles(dirURL: dirURL, fileManager: fileManager)
+            }
+        }
+
+        let contents = try fileManager.contentsOfDirectory(
+            at: dirURL,
+            includingPropertiesForKeys: [.nameKey],
+            options: [.skipsHiddenFiles]
+        )
+
+        let mdFiles = contents
+            .filter { $0.pathExtension == "md" }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+
+        var files: [CronJobFile] = []
+        for fileURL in mdFiles {
+            let markdown = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+            let parsed = parse(markdown: markdown)
+            var jobFile = CronJobFile(
+                fileName: fileURL.lastPathComponent,
+                filePath: fileURL.path,
+                fileURL: fileURL,
+                jobs: parsed.jobs,
+                actions: parsed.actions,
+                rawMarkdown: markdown
+            )
+            if jobFile.actions.isEmpty {
+                jobFile.actions = synthesizeActions(from: jobFile.jobs)
+            }
+            files.append(jobFile)
+        }
+
+        return (files: files, directoryPath: dirURL.path)
+    }
+
+    // MARK: - Migration from legacy job.md
+
+    private static func migrateFromLegacy(legacyURL: URL, dirURL: URL, fileManager: FileManager) throws {
+        let markdown = (try? String(contentsOf: legacyURL, encoding: .utf8)) ?? ""
+        let parsed = parse(markdown: markdown)
+
+        try fileManager.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+
+        if parsed.jobs.isEmpty {
+            // No parseable jobs, just move the whole file as-is
+            let destURL = dirURL.appendingPathComponent("job.md", isDirectory: false)
+            try markdown.write(to: destURL, atomically: true, encoding: .utf8)
+            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destURL.path)
+        } else {
+            // Split into per-job files
+            let actionsByName = Dictionary(
+                parsed.actions.map { ($0.name.trimmingCharacters(in: .whitespacesAndNewlines), $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+
+            for job in parsed.jobs {
+                let safeName = job.name
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: "/", with: "-")
+                    .replacingOccurrences(of: " ", with: "-")
+                let fileName = safeName.isEmpty ? "job" : safeName
+                let fileURL = dirURL.appendingPathComponent("\(fileName).md", isDirectory: false)
+
+                var lines: [String] = []
+                lines.append("# Cron Jobs")
+                lines.append("")
+                lines.append("## \(job.name)")
+                lines.append("- cron: \(job.cron)")
+                lines.append("- enabled: \(job.enabled ? "true" : "false")")
+                lines.append("- action: \(job.action)")
+                let notify = job.notify.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !notify.isEmpty {
+                    lines.append("- notify: \(notify)")
+                }
+                lines.append("")
+
+                let actionKey = job.action.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let action = actionsByName[actionKey] ?? actionsByName[job.name.trimmingCharacters(in: .whitespacesAndNewlines)] {
+                    lines.append("# Action Behaviors")
+                    lines.append("")
+                    lines.append("## \(action.name)")
+                    lines.append("- command: \(action.command)")
+                    lines.append("- enabled: \(action.enabled ? "true" : "false")")
+                    let actionNotify = action.notify.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !actionNotify.isEmpty {
+                        lines.append("- notify: \(actionNotify)")
+                    }
+                    lines.append("")
+                }
+
+                let content = lines.joined(separator: "\n")
+                try content.write(to: fileURL, atomically: true, encoding: .utf8)
+                try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+            }
+        }
+
+        // Rename old file to .bak
+        let backupURL = legacyURL.deletingPathExtension().appendingPathExtension("md.bak")
+        try? fileManager.moveItem(at: legacyURL, to: backupURL)
+    }
+
+    // MARK: - Seed default job files
+
+    private static func seedDefaultJobFiles(dirURL: URL, fileManager: FileManager) throws {
+        try fileManager.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+
+        let defaults: [(name: String, content: String)] = [
+            ("health-check", """
+            # Cron Jobs
+
+            ## health-check
+            - cron: */2 * * * *
+            - enabled: true
+            - action: health-check
+            - notify: +79263413353
+
+            # Action Behaviors
+
+            ## health-check
+            - command: health-check
+            - enabled: true
+            - notify: +79263413353
+            """),
+            ("session-cleanup", """
+            # Cron Jobs
+
+            ## session-cleanup
+            - cron: 0 */6 * * *
+            - enabled: true
+            - action: session-cleanup
+
+            # Action Behaviors
+
+            ## session-cleanup
+            - command: session-cleanup
+            - enabled: true
+            """),
+            ("daily-report", """
+            # Cron Jobs
+
+            ## daily-report
+            - cron: 0 9 * * *
+            - enabled: false
+            - action: daily-report
+            - notify: +xxx
+
+            # Action Behaviors
+
+            ## daily-report
+            - command: daily-report
+            - enabled: false
+            - notify: +xxx
+            """),
+        ]
+
+        for (name, content) in defaults {
+            let fileURL = dirURL.appendingPathComponent("\(name).md", isDirectory: false)
+            try content.write(to: fileURL, atomically: true, encoding: .utf8)
+            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        }
+    }
+
+    // MARK: - Markdown parsing (unchanged, works per-file)
+
+    static func parse(markdown: String) -> (jobs: [CronJobConfigEntry], actions: [CronActionBehaviorEntry]) {
+        enum Section {
+            case none
+            case jobs
+            case actions
+        }
+
+        var section: Section = .none
+        var jobs: [CronJobConfigEntry] = []
+        var actions: [CronActionBehaviorEntry] = []
+        var currentJob: CronJobConfigEntry?
+        var currentAction: CronActionBehaviorEntry?
+
+        func flushCurrent() {
+            if let currentJob {
+                jobs.append(currentJob)
+            }
+            if let currentAction {
+                actions.append(currentAction)
+            }
+            currentJob = nil
+            currentAction = nil
+        }
+
+        for rawLine in markdown.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+
+            if line.hasPrefix("# ") {
+                flushCurrent()
+                let title = String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if title == "cron jobs" {
+                    section = .jobs
+                } else if title == "action behaviors" {
+                    section = .actions
+                } else {
+                    section = .none
+                }
+                continue
+            }
+
+            if line.hasPrefix("## ") {
+                flushCurrent()
+                let name = String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if section == .jobs {
+                    currentJob = CronJobConfigEntry(name: name, cron: "*/5 * * * *", enabled: true, action: name, notify: "")
+                } else if section == .actions {
+                    currentAction = CronActionBehaviorEntry(name: name, command: name, enabled: true, notify: "")
+                }
+                continue
+            }
+
+            guard line.hasPrefix("- "),
+                  let colonIndex = line.firstIndex(of: ":") else { continue }
+            let key = String(line[line.index(line.startIndex, offsetBy: 2)..<colonIndex])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let value = String(line[line.index(after: colonIndex)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if currentJob != nil {
+                switch key {
+                case "cron":
+                    currentJob?.cron = value
+                case "enabled":
+                    currentJob?.enabled = boolValue(value)
+                case "action":
+                    currentJob?.action = value
+                case "notify":
+                    currentJob?.notify = value
+                default:
+                    break
+                }
+            } else if currentAction != nil {
+                switch key {
+                case "command", "script":
+                    currentAction?.command = value
+                case "enabled":
+                    currentAction?.enabled = boolValue(value)
+                case "notify":
+                    currentAction?.notify = value
+                default:
+                    break
+                }
+            }
+        }
+
+        flushCurrent()
+        return (jobs, actions)
+    }
+
+    private static func boolValue(_ value: String) -> Bool {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "true", "yes", "on":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func synthesizeActions(from jobs: [CronJobConfigEntry]) -> [CronActionBehaviorEntry] {
+        var seen: Set<String> = []
+        var result: [CronActionBehaviorEntry] = []
+        for job in jobs {
+            let rawAction = job.action.trimmingCharacters(in: .whitespacesAndNewlines)
+            let actionName = rawAction.isEmpty ? job.name.trimmingCharacters(in: .whitespacesAndNewlines) : rawAction
+            guard !actionName.isEmpty, seen.insert(actionName).inserted else { continue }
+            result.append(
+                CronActionBehaviorEntry(
+                    name: actionName,
+                    command: actionName,
+                    enabled: job.enabled,
+                    notify: job.notify
+                )
+            )
+        }
+        return result
+    }
+}
+
+// MARK: - CronJobsEditorViewModel
+
+@MainActor
+private final class CronJobsEditorViewModel: ObservableObject {
+    @Published var jobFiles: [CronJobFile] = []
+    @Published var selectedFileId: UUID?
+    @Published var directoryPath: String = ""
+    @Published var statusMessage: String = ""
+    @Published var hasLoaded = false
+
+    var selectedFile: CronJobFile? {
+        guard let selectedFileId else { return nil }
+        return jobFiles.first { $0.id == selectedFileId }
+    }
+
+    // Directory watching
+    private nonisolated(unsafe) var directoryWatchSource: DispatchSourceFileSystemObject?
+    private nonisolated(unsafe) var directoryFd: Int32 = -1
+    private let watchQueue = DispatchQueue(label: "com.cmux.cronjobs-dir-watch", qos: .utility)
+    private var reloadWorkItem: DispatchWorkItem?
+
+    func loadIfNeeded() {
+        guard !hasLoaded else { return }
+        hasLoaded = true
+        reload()
+        startDirectoryWatcher()
+    }
+
+    func reload() {
+        do {
+            let loaded = try CronJobMarkdownStore.loadAll()
+            let previousSelectedId = selectedFileId
+            let previousSelectedName = jobFiles.first { $0.id == previousSelectedId }?.fileName
+            jobFiles = loaded.files
+            directoryPath = loaded.directoryPath
+            // Restore selection by filename, or fall back to first file
+            if let previousSelectedName,
+               let match = jobFiles.first(where: { $0.fileName == previousSelectedName }) {
+                selectedFileId = match.id
+            } else {
+                selectedFileId = jobFiles.first?.id
+            }
+            statusMessage = String(localized: "cronjob.editor.loaded", defaultValue: "Loaded \(jobFiles.count) job files")
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func openInTextEdit(fileURL: URL) {
+        let editorURL = URL(fileURLWithPath: "/System/Applications/TextEdit.app")
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open([fileURL], withApplicationAt: editorURL, configuration: configuration)
+    }
+
+    func openDirectoryInFinder() {
+        guard !directoryPath.isEmpty else { return }
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: directoryPath)
+    }
+
+    // MARK: - Directory watcher
+
+    private func startDirectoryWatcher() {
+        guard directoryWatchSource == nil, !directoryPath.isEmpty else { return }
+        let fd = Darwin.open(directoryPath, O_EVTONLY)
+        guard fd >= 0 else { return }
+        directoryFd = fd
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .link, .rename],
+            queue: watchQueue
+        )
+
+        source.setEventHandler { [weak self] in
+            // Debounce: coalesce rapid changes
+            self?.scheduleReload()
+        }
+
+        source.setCancelHandler {
+            Darwin.close(fd)
+        }
+
+        source.resume()
+        directoryWatchSource = source
+    }
+
+    private func scheduleReload() {
+        reloadWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                self?.reload()
+            }
+        }
+        reloadWorkItem = item
+        watchQueue.asyncAfter(deadline: .now() + 0.3, execute: item)
+    }
+
+    private func stopDirectoryWatcher() {
+        directoryWatchSource?.cancel()
+        directoryWatchSource = nil
+        directoryFd = -1
+    }
+
+    deinit {
+        directoryWatchSource?.cancel()
+    }
+}
+
+// MARK: - CronJobsPopoverView
+
+private struct CronJobsPopoverView: View {
+    @StateObject private var viewModel = CronJobsEditorViewModel()
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Header
+            HStack(spacing: 10) {
+                Text(String(localized: "cronjob.editor.title", defaultValue: "Cron Jobs"))
+                    .font(.headline)
+                Spacer()
+                Button {
+                    viewModel.openDirectoryInFinder()
+                } label: {
+                    Label(
+                        String(localized: "cronjob.editor.openFolder", defaultValue: "Open Folder"),
+                        systemImage: "folder"
+                    )
+                    .font(.system(size: 12))
+                }
+                .buttonStyle(.borderless)
+            }
+
+            if !viewModel.directoryPath.isEmpty {
+                Text(viewModel.directoryPath)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+
+            Divider()
+
+            // Main content: sidebar + preview
+            HStack(spacing: 0) {
+                // Sidebar: file list
+                fileListSidebar
+                    .frame(width: 200)
+
+                Divider()
+
+                // Preview: rendered markdown
+                markdownPreview
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxHeight: .infinity)
+
+            // Status bar
+            if !viewModel.statusMessage.isEmpty {
+                Text(viewModel.statusMessage)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(12)
+        .frame(width: 680, height: 520)
+        .onAppear {
+            viewModel.loadIfNeeded()
+        }
+    }
+
+    // MARK: - File list sidebar
+
+    private var fileListSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if viewModel.jobFiles.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "doc.text")
+                        .font(.system(size: 24))
+                        .foregroundColor(.secondary)
+                    Text(String(localized: "cronjob.editor.noFiles", defaultValue: "No job files found"))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(viewModel.jobFiles, selection: $viewModel.selectedFileId) { file in
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.text")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        Text(file.fileName.replacingOccurrences(of: ".md", with: ""))
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer()
+                        Button {
+                            viewModel.openInTextEdit(fileURL: file.fileURL)
+                        } label: {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help(String(localized: "cronjob.editor.edit", defaultValue: "Edit"))
+                    }
+                    .padding(.vertical, 2)
+                    .tag(file.id)
+                }
+                .listStyle(.sidebar)
+            }
+        }
+    }
+
+    // MARK: - Markdown preview
+
+    private var markdownPreview: some View {
+        Group {
+            if let file = viewModel.selectedFile {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        // File name header
+                        HStack(spacing: 6) {
+                            Image(systemName: "doc.richtext")
+                                .foregroundColor(.secondary)
+                                .font(.system(size: 12))
+                            Text(file.fileName)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                            Button {
+                                viewModel.openInTextEdit(fileURL: file.fileURL)
+                            } label: {
+                                Label(
+                                    String(localized: "cronjob.editor.edit", defaultValue: "Edit"),
+                                    systemImage: "pencil.circle"
+                                )
+                                .font(.system(size: 12))
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                        .padding(.bottom, 6)
+
+                        Divider()
+                            .padding(.horizontal, 12)
+
+                        Markdown(file.rawMarkdown)
+                            .markdownTheme(cronJobMarkdownTheme)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+                    }
+                }
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 28))
+                        .foregroundColor(.secondary)
+                    Text(String(localized: "cronjob.editor.selectFile", defaultValue: "Select a job file to preview"))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    // MARK: - Markdown theme (matches MarkdownPanelView)
+
+    private var cronJobMarkdownTheme: Theme {
+        let isDark = colorScheme == .dark
+
+        return Theme()
+            .text {
+                ForegroundColor(isDark ? .white.opacity(0.9) : .primary)
+                FontSize(13)
+            }
+            .heading1 { configuration in
+                VStack(alignment: .leading, spacing: 6) {
+                    configuration.label
+                        .markdownTextStyle {
+                            FontWeight(.bold)
+                            FontSize(22)
+                            ForegroundColor(isDark ? .white : .primary)
+                        }
+                    Divider()
+                }
+                .markdownMargin(top: 16, bottom: 10)
+            }
+            .heading2 { configuration in
+                VStack(alignment: .leading, spacing: 4) {
+                    configuration.label
+                        .markdownTextStyle {
+                            FontWeight(.bold)
+                            FontSize(18)
+                            ForegroundColor(isDark ? .white : .primary)
+                        }
+                    Divider()
+                }
+                .markdownMargin(top: 14, bottom: 8)
+            }
+            .heading3 { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        FontWeight(.semibold)
+                        FontSize(15)
+                        ForegroundColor(isDark ? .white : .primary)
+                    }
+                    .markdownMargin(top: 12, bottom: 6)
+            }
+            .codeBlock { configuration in
+                ScrollView(.horizontal, showsIndicators: true) {
+                    configuration.label
+                        .markdownTextStyle {
+                            FontFamilyVariant(.monospaced)
+                            FontSize(12)
+                            ForegroundColor(isDark ? Color(red: 0.9, green: 0.9, blue: 0.9) : Color(red: 0.2, green: 0.2, blue: 0.2))
+                        }
+                        .padding(10)
+                }
+                .background(isDark
+                    ? Color(nsColor: NSColor(white: 0.08, alpha: 1.0))
+                    : Color(nsColor: NSColor(white: 0.93, alpha: 1.0)))
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .markdownMargin(top: 6, bottom: 6)
+            }
+            .code {
+                FontFamilyVariant(.monospaced)
+                FontSize(12)
+                ForegroundColor(isDark ? Color(red: 0.85, green: 0.6, blue: 0.95) : Color(red: 0.6, green: 0.2, blue: 0.7))
+                BackgroundColor(isDark
+                    ? Color(nsColor: NSColor(white: 0.18, alpha: 1.0))
+                    : Color(nsColor: NSColor(white: 0.92, alpha: 1.0)))
+            }
+            .blockquote { configuration in
+                HStack(spacing: 0) {
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(isDark ? Color.white.opacity(0.2) : Color.gray.opacity(0.4))
+                        .frame(width: 3)
+                    configuration.label
+                        .markdownTextStyle {
+                            ForegroundColor(isDark ? .white.opacity(0.6) : .secondary)
+                            FontSize(13)
+                        }
+                        .padding(.leading, 10)
+                }
+                .markdownMargin(top: 6, bottom: 6)
+            }
+            .link {
+                ForegroundColor(Color.accentColor)
+            }
+            .strong {
+                FontWeight(.semibold)
+            }
+            .thematicBreak {
+                Divider()
+                    .markdownMargin(top: 12, bottom: 12)
+            }
+            .listItem { configuration in
+                configuration.label
+                    .markdownMargin(top: 3, bottom: 3)
+            }
+            .paragraph { configuration in
+                configuration.label
+                    .markdownMargin(top: 3, bottom: 6)
+            }
+    }
+}
+
 struct ShortcutHintLanePlanner {
     static func assignLanes(for intervals: [ClosedRange<CGFloat>], minSpacing: CGFloat = 4) -> [Int] {
         guard !intervals.isEmpty else { return [] }
@@ -264,6 +1044,7 @@ struct TitlebarControlsView: View {
     @State private var shortcutRefreshTick = 0
     @State private var isHoveringControls = false
     @State private var isNotificationsPopoverShown = false
+    @State private var isCronJobsPopoverShown = false
     @StateObject private var modifierKeyMonitor = TitlebarShortcutHintModifierMonitor()
     private let titlebarHintRightSafetyShift: CGFloat = 10
     private let titlebarHintBaseXShift: CGFloat = -10
@@ -302,7 +1083,7 @@ struct TitlebarControlsView: View {
         if visibilityMode == .alwaysVisible {
             return true
         }
-        return isHoveringControls || isNotificationsPopoverShown || shouldShowTitlebarShortcutHints
+        return isHoveringControls || isNotificationsPopoverShown || isCronJobsPopoverShown || shouldShowTitlebarShortcutHints
     }
 
     var body: some View {
@@ -395,6 +1176,18 @@ struct TitlebarControlsView: View {
             .background(NotificationsAnchorView { viewModel.notificationsAnchorView = $0 })
             .accessibilityLabel(String(localized: "titlebar.notifications.accessibilityLabel", defaultValue: "Notifications"))
             .safeHelp(KeyboardShortcutSettings.Action.showNotifications.tooltip(String(localized: "titlebar.notifications.tooltip", defaultValue: "Show notifications")))
+
+            TitlebarControlButton(config: config, action: {
+                isCronJobsPopoverShown.toggle()
+            }) {
+                iconLabel(systemName: "clock", config: config)
+            }
+            .accessibilityIdentifier("titlebarControl.showCronJobs")
+            .accessibilityLabel(String(localized: "titlebar.cron.accessibilityLabel", defaultValue: "Cron Jobs"))
+            .safeHelp(String(localized: "titlebar.cron.tooltip", defaultValue: "Edit cron jobs"))
+            .popover(isPresented: $isCronJobsPopoverShown, arrowEdge: .bottom) {
+                CronJobsPopoverView()
+            }
 
             TitlebarControlButton(config: config, action: {
                 #if DEBUG

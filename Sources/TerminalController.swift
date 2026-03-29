@@ -1976,10 +1976,88 @@ class TerminalController {
             case "surface_health":
                 return surfaceHealth(args)
 
+            // MARK: WEA hook bridge commands
+            case "wea_claude_stop":
+                return weaClaudeStop(args)
+            case "wea_claude_notification":
+                return weaClaudeNotification(args)
+            case "wea_session_start":
+                return weaSessionStart(args)
+            case "wea_ask_question":
+                return weaAskQuestion(args)
+
             default:
                 return "ERROR: Unknown command '\(cmd)'. Use 'help' for available commands."
             }
         }
+    }
+
+    // MARK: - WEA Hook Bridge
+
+    private func weaClaudeStop(_ args: String) -> String {
+        guard let data = args.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "ERROR: Invalid JSON"
+        }
+        let workspaceId = json["workspace_id"] as? String ?? ""
+        let transcriptPath = json["transcript_path"] as? String
+        let lastMessage = json["last_message"] as? String
+        DispatchQueue.main.async {
+            WeaBotService.shared.handleClaudeStop(
+                workspaceId: workspaceId,
+                transcriptPath: transcriptPath,
+                lastMessage: lastMessage
+            )
+        }
+        return "OK"
+    }
+
+    private func weaClaudeNotification(_ args: String) -> String {
+        guard let data = args.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "ERROR: Invalid JSON"
+        }
+        let workspaceId = json["workspace_id"] as? String ?? ""
+        let question = json["question"] as? String ?? ""
+        DispatchQueue.main.async {
+            WeaBotService.shared.handleClaudeNotification(
+                workspaceId: workspaceId,
+                question: question
+            )
+        }
+        return "OK"
+    }
+
+    private func weaSessionStart(_ args: String) -> String {
+        guard let data = args.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "ERROR: Invalid JSON"
+        }
+        let workspaceId = json["workspace_id"] as? String ?? ""
+        let transcriptPath = json["transcript_path"] as? String
+        DispatchQueue.main.async {
+            WeaBotService.shared.handleSessionStart(
+                workspaceId: workspaceId,
+                transcriptPath: transcriptPath
+            )
+        }
+        return "OK"
+    }
+
+    private func weaAskQuestion(_ args: String) -> String {
+        guard let data = args.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "ERROR: Invalid JSON"
+        }
+        let workspaceId = json["workspace_id"] as? String ?? ""
+        let questionText = json["question"] as? String ?? ""
+        DispatchQueue.main.async {
+            WeaBotService.shared.handleAskUserQuestion(
+                workspaceId: workspaceId,
+                questionText: questionText
+            )
+        }
+        return "OK"
     }
 
     // MARK: - V2 JSON Socket Protocol
@@ -14856,21 +14934,18 @@ class TerminalController {
                     tabId: scope.workspaceId,
                     surfaceId: scope.panelId,
                     branch: branch,
-                    isDirty: isDirty
+                    isDirty: isDirty,
+                    skipGitRefresh: true
                 )
             }
             return "OK"
         }
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
-            }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let tab = self.resolveTabForReport(args) else { return }
             tab.gitBranch = SidebarGitBranchState(branch: branch, isDirty: isDirty)
         }
-        return result
+        return "OK"
     }
 
     private func clearGitBranch(_ args: String) -> String {
@@ -14888,19 +14963,15 @@ class TerminalController {
                 let validSurfaceIds = Set(tab.panels.keys)
                 tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
                 guard validSurfaceIds.contains(scope.panelId) else { return }
-                tabManager.clearSurfaceGitBranch(tabId: scope.workspaceId, surfaceId: scope.panelId)
+                tabManager.clearSurfaceGitBranch(tabId: scope.workspaceId, surfaceId: scope.panelId, skipGitRefresh: true)
             }
             return "OK"
         }
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = "ERROR: Tab not found"
-                return
-            }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let tab = self.resolveTabForReport(args) else { return }
             tab.gitBranch = nil
         }
-        return result
+        return "OK"
     }
 
     private func reportPullRequest(_ args: String) -> String {
@@ -15057,48 +15128,32 @@ class TerminalController {
                 let validSurfaceIds = Set(tab.panels.keys)
                 tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
                 guard validSurfaceIds.contains(scope.panelId) else { return }
-                tabManager.updateSurfaceDirectory(tabId: scope.workspaceId, surfaceId: scope.panelId, directory: directory)
+                tabManager.updateSurfaceDirectory(tabId: scope.workspaceId, surfaceId: scope.panelId, directory: directory, skipGitRefresh: true)
             }
             return "OK"
         }
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
-            }
+        let options = parsed.options
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let tabManager = self.tabManager,
+                  let tab = self.resolveTabForReport(args) else { return }
 
             let validSurfaceIds = Set(tab.panels.keys)
             tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
 
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
+            let panelArg = options["panel"] ?? options["surface"]
             let surfaceId: UUID
             if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: report_pwd <path> [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
+                guard !panelArg.isEmpty, let parsedId = UUID(uuidString: panelArg) else { return }
                 surfaceId = parsedId
             } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
+                guard let focused = tab.focusedPanelId else { return }
                 surfaceId = focused
             }
 
-            guard validSurfaceIds.contains(surfaceId) else {
-                result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                return
-            }
-
+            guard validSurfaceIds.contains(surfaceId) else { return }
             tabManager.updateSurfaceDirectory(tabId: tab.id, surfaceId: surfaceId, directory: directory)
         }
-        return result
+        return "OK"
     }
 
     private func reportShellState(_ args: String) -> String {
@@ -15127,44 +15182,28 @@ class TerminalController {
 
         guard let tabManager else { return "ERROR: TabManager not available" }
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
-            }
+        let options = parsed.options
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let tabManager = self.tabManager,
+                  let tab = self.resolveTabForReport(args) else { return }
 
             let validSurfaceIds = Set(tab.panels.keys)
             tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
 
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
+            let panelArg = options["panel"] ?? options["surface"]
             let surfaceId: UUID
             if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: report_shell_state <prompt|running> [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
+                guard !panelArg.isEmpty, let parsedId = UUID(uuidString: panelArg) else { return }
                 surfaceId = parsedId
             } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
+                guard let focused = tab.focusedPanelId else { return }
                 surfaceId = focused
             }
 
-            guard validSurfaceIds.contains(surfaceId) else {
-                result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                return
-            }
-
+            guard validSurfaceIds.contains(surfaceId) else { return }
             tabManager.updateSurfaceShellActivity(tabId: tab.id, surfaceId: surfaceId, state: state)
         }
-        return result
+        return "OK"
     }
 
     private func clearPorts(_ args: String) -> String {
@@ -15223,43 +15262,27 @@ class TerminalController {
             return "OK"
         }
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
-            }
+        let options = parsed.options
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let tab = self.resolveTabForReport(args) else { return }
 
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
+            let panelArg = options["panel"] ?? options["surface"]
             let surfaceId: UUID
             if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: report_tty <tty_name> [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
+                guard !panelArg.isEmpty, let parsedId = UUID(uuidString: panelArg) else { return }
                 surfaceId = parsedId
             } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
+                guard let focused = tab.focusedPanelId else { return }
                 surfaceId = focused
             }
 
             let validSurfaceIds = Set(tab.panels.keys)
-            guard validSurfaceIds.contains(surfaceId) else {
-                result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                return
-            }
+            guard validSurfaceIds.contains(surfaceId) else { return }
 
             tab.surfaceTTYNames[surfaceId] = ttyName
             PortScanner.shared.registerTTY(workspaceId: tab.id, panelId: surfaceId, ttyName: ttyName)
         }
-        return result
+        return "OK"
     }
 
     private func portsKick(_ args: String) -> String {
