@@ -6275,11 +6275,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @MainActor
     func showWeaBotConfig() {
-        // Ensure WeaBotService has a reference to tabManager for workspace creation
-        if let tabManager {
-            WeaBotService.shared.tabManager = tabManager
-        }
-
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 400),
             styleMask: [.titled, .closable, .resizable],
