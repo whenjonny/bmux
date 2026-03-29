@@ -2712,6 +2712,23 @@ class TabManager: ObservableObject {
 
     @discardableResult
     func closeWorkspaceWithConfirmation(_ workspace: Workspace) -> Bool {
+        // WEA workspace requires disconnect confirmation
+        if workspace.title == "main-wea" && WeaBotService.shared.isRunning {
+            guard confirmClose(
+                title: String(localized: "weaBot.close.title", defaultValue: "Disconnect WEA Bot?"),
+                message: String(
+                    localized: "weaBot.close.message",
+                    defaultValue: "Closing this workspace will disconnect the WEA bot. All group chat sessions will be terminated."
+                ),
+                acceptCmdD: tabs.count <= 1
+            ) else {
+                return false
+            }
+            WeaBotService.shared.stop()
+            closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
+            return true
+        }
+
         if workspace.isPinned {
             guard confirmClose(
                 title: String(localized: "dialog.closePinnedWorkspace.title", defaultValue: "Close pinned workspace?"),

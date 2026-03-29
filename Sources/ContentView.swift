@@ -11817,6 +11817,14 @@ private struct TabItemView: View, Equatable {
         }
         .disabled(targetIds.isEmpty)
 
+        // WEA Bot workspace actions
+        if tab.title == "main-wea" && WeaBotService.shared.isRunning {
+            Divider()
+            Button(String(localized: "contextMenu.disconnectWeaBot", defaultValue: "Disconnect WEA Bot")) {
+                WeaBotService.shared.stop()
+            }
+        }
+
         Divider()
 
         if let key = closeWorkspaceShortcut.keyEquivalent {
