@@ -35,7 +35,7 @@ final class WeaWorkspaceManager {
         guard let tabManager else { return }
         let workspace = tabManager.addWorkspace(
             title: "wea",
-            initialTerminalCommand: "codemax claude --allow-dangerously-skip-permissions",
+            initialTerminalCommand: "codemax claude --allow-dangerously-skip-permissions --model=bedrock-claude-4-6-opus",
             select: true
         )
         weaWorkspace = workspace

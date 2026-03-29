@@ -133,6 +133,11 @@ struct WeaBotConfigSheet: View {
                 secretLoaded = true
             }
         }
+        .onChange(of: service.state) { newState in
+            if newState == .running {
+                dismiss()
+            }
+        }
     }
 
     private func fieldRow<Content: View>(label: String, @ViewBuilder content: () -> Content) -> some View {
