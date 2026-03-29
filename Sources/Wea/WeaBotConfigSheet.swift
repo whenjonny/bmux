@@ -6,6 +6,7 @@ struct WeaBotConfigSheet: View {
     @ObservedObject private var config = WeaBotConfig.shared
     @ObservedObject private var service = WeaBotService.shared
     @State private var appSecret: String = ""
+    @State private var secretLoaded = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -36,7 +37,8 @@ struct WeaBotConfigSheet: View {
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 220)
                             .onChange(of: appSecret) { newValue in
-                                if !newValue.isEmpty {
+                                guard secretLoaded else { return }
+                                if !newValue.isEmpty && newValue != "••••••••" {
                                     config.saveSecret(newValue)
                                 }
                             }
@@ -125,6 +127,10 @@ struct WeaBotConfigSheet: View {
         .onAppear {
             if config.loadSecret() != nil {
                 appSecret = "••••••••"
+            }
+            // Allow onChange to save only after initial placeholder is set
+            DispatchQueue.main.async {
+                secretLoaded = true
             }
         }
     }
