@@ -14,72 +14,117 @@ private func weaLog(_ message: String) {
     }
 }
 
-/// Bridges WEA messages to/from Claude using one-shot subprocess per message.
-/// Matches the Node.js architecture: `claude -p <prompt> --output-format stream-json --resume <sessionId>`
+/// Bridges WEA messages to/from a terminal running Claude REPL.
 /// One instance per session (DM or group chat tab).
-final class WeaTerminalBridge: @unchecked Sendable {
+/// Messages are injected into the terminal so the user can see and interact.
+@MainActor
+final class WeaTerminalBridge {
     enum State: Equatable {
         case idle
-        case processing       // Claude subprocess is running
-        case waitingInput     // Not used in one-shot mode, kept for API compat
+        case processing       // Claude is working on a WEA message
+        case waitingInput     // Claude is asking a question
     }
 
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaTerminalBridge")
     let sessionKey: String              // "direct:{wuid}" or "group:{groupId}"
+    private weak var panel: TerminalPanel?
     private let httpClient: WeaHttpClient
     private let dest: WeaMessageDest
 
     private(set) var state: State = .idle
     private var activeCardId: String?
-    private var claudeSessionId: String?
-    private var accumulatedText: String = ""
-    private var lastRefreshTime: Date = .distantPast
-    private let refreshThrottleInterval: TimeInterval = 0.8
-    private var currentProcess: Process?
-
-    /// Working directory for Claude sessions
-    private let workDir: String
+    private var pendingMessages: [String] = []
+    private var replReady = false
+    private var readyCheckTimer: Timer?
 
     /// Set by WeaBotService when a WEA message is being injected.
-    var isWeaMessageActive: Bool { state == .processing }
+    /// Claude Code hooks check this to know if the current prompt is from WEA.
+    var isWeaMessageActive: Bool { state == .processing || state == .waitingInput }
 
-    /// Kept for API compat with WeaBotService
+    /// Flag file used by hooks to detect WEA-originated prompts.
     nonisolated let weaActiveMarkerPath: String
 
-    init(sessionKey: String, httpClient: WeaHttpClient, dest: WeaMessageDest) {
+    init(sessionKey: String, panel: TerminalPanel, httpClient: WeaHttpClient, dest: WeaMessageDest) {
         self.sessionKey = sessionKey
+        self.panel = panel
         self.httpClient = httpClient
         self.dest = dest
         let safe = sessionKey.replacingOccurrences(of: ":", with: "_")
         self.weaActiveMarkerPath = "\(NSTemporaryDirectory())cmux-wea-active-\(safe)"
 
-        // Create a per-session working directory
-        let dir = NSTemporaryDirectory() + "cmux-wea-sessions/\(safe)"
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        self.workDir = dir
-
-        // Try to load persisted session ID
-        let idFile = dir + "/.claude-session-id"
-        self.claudeSessionId = try? String(contentsOfFile: idFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Start checking if the REPL is ready
+        startReadyCheck()
     }
 
     deinit {
-        currentProcess?.terminate()
+        readyCheckTimer?.invalidate()
         try? FileManager.default.removeItem(atPath: weaActiveMarkerPath)
     }
 
-    // MARK: - Process WEA message via one-shot subprocess
+    // MARK: - REPL Ready Detection
+
+    /// Periodically check if the Claude REPL is ready to accept input.
+    /// We consider it ready after a delay from panel creation (Claude CLI startup time).
+    private func startReadyCheck() {
+        // Give Claude CLI time to start up (auth, model selection, REPL init)
+        // Check every 2 seconds, mark ready after 15 seconds or when we detect activity
+        var elapsed: TimeInterval = 0
+        let checkInterval: TimeInterval = 2.0
+        let maxWait: TimeInterval = 20.0
+
+        readyCheckTimer = Timer.scheduledTimer(withTimeInterval: checkInterval, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            elapsed += checkInterval
+
+            if elapsed >= maxWait {
+                timer.invalidate()
+                self.readyCheckTimer = nil
+                self.markReady()
+            }
+        }
+    }
+
+    private func markReady() {
+        guard !replReady else { return }
+        replReady = true
+        weaLog("[Bridge:\(sessionKey)] REPL marked as ready, pending=\(pendingMessages.count)")
+
+        // Flush pending messages
+        if let first = pendingMessages.first {
+            pendingMessages.removeFirst()
+            Task {
+                await doInjectMessage(first)
+            }
+        }
+    }
+
+    // MARK: - Inject WEA message into terminal
 
     func injectMessage(_ text: String) async {
-        guard state == .idle else {
-            weaLog("[Bridge:\(sessionKey)] Busy, ignoring message: \(text.prefix(50))")
+        if !replReady {
+            weaLog("[Bridge:\(sessionKey)] REPL not ready, queueing: \(text.prefix(50))")
+            pendingMessages.append(text)
+            return
+        }
+
+        if state == .processing {
+            weaLog("[Bridge:\(sessionKey)] Busy processing, queueing: \(text.prefix(50))")
+            pendingMessages.append(text)
+            return
+        }
+
+        await doInjectMessage(text)
+    }
+
+    private func doInjectMessage(_ text: String) async {
+        guard let panel else {
+            logger.warning("Panel is nil for session \(self.sessionKey)")
             return
         }
 
         state = .processing
-        accumulatedText = ""
-
-        weaLog("[Bridge:\(sessionKey)] Processing message: \(text.prefix(100))")
+        writeMarker()
+        weaLog("[Bridge:\(sessionKey)] Injecting message: \(text.prefix(100))")
 
         // Send initial "thinking..." card to WEA
         do {
@@ -91,232 +136,139 @@ final class WeaTerminalBridge: @unchecked Sendable {
             logger.error("Failed to send thinking card: \(error.localizedDescription)")
         }
 
-        // Run Claude in one-shot mode
-        let response = await runClaude(prompt: text)
+        // Inject the message text into the terminal + Enter
+        panel.sendInput(text + "\n")
+    }
 
-        weaLog("[Bridge:\(sessionKey)] Got response (\(response.count) chars): \(response.prefix(200))")
+    // MARK: - Hook Callbacks (called by WeaBotService)
 
-        // Send final reply to WEA
-        guard !response.isEmpty else {
-            state = .idle
-            activeCardId = nil
+    /// Called when Stop hook fires — Claude finished responding.
+    func onClaudeStop(transcriptPath: String?, lastMessage: String?) async {
+        guard state == .processing || state == .waitingInput else { return }
+
+        // Read full reply from transcript if available
+        let fullReply: String
+        if let path = transcriptPath {
+            fullReply = readLastAssistantMessage(from: path) ?? lastMessage ?? ""
+        } else {
+            fullReply = lastMessage ?? ""
+        }
+
+        weaLog("[Bridge:\(sessionKey)] Claude stopped, reply=\(fullReply.count) chars")
+
+        guard !fullReply.isEmpty else {
+            finishProcessing()
             return
         }
 
+        // Send final reply to WEA
         do {
             if let cardId = activeCardId {
-                try await httpClient.refreshCard(cardId: cardId, content: response, dest: dest)
+                try await httpClient.refreshCard(cardId: cardId, content: fullReply, dest: dest)
             } else {
-                try await httpClient.sendReply(text: response, dest: dest)
+                try await httpClient.sendReply(text: fullReply, dest: dest)
             }
         } catch {
             logger.error("Failed to send reply to WEA: \(error.localizedDescription)")
         }
 
+        finishProcessing()
+    }
+
+    /// Called when Claude needs user input (Notification hook).
+    func onNeedsInput(question: String) async {
+        state = .waitingInput
+
+        do {
+            try await httpClient.sendReply(text: question, dest: dest)
+        } catch {
+            logger.error("Failed to forward question to WEA: \(error.localizedDescription)")
+        }
+    }
+
+    /// Called when PreToolUse fires AskUserQuestion.
+    func onAskUserQuestion(questionText: String) async {
+        state = .waitingInput
+
+        do {
+            try await httpClient.sendReply(text: questionText, dest: dest)
+        } catch {
+            logger.error("Failed to forward AskUserQuestion to WEA: \(error.localizedDescription)")
+        }
+    }
+
+    /// Called when a WEA user replies to a question.
+    func injectQuestionReply(_ reply: String) {
+        guard state == .waitingInput, let panel else { return }
+        state = .processing
+        panel.sendInput(reply + "\n")
+    }
+
+    /// Called by claude-hook when SessionStart fires.
+    func startTranscriptWatch(path: String) {
+        weaLog("[Bridge:\(sessionKey)] Transcript: \(path)")
+        // If we haven't marked ready yet, mark now (Claude session started = REPL is ready)
+        if !replReady {
+            readyCheckTimer?.invalidate()
+            readyCheckTimer = nil
+            markReady()
+        }
+    }
+
+    // MARK: - Finish & Queue
+
+    private func finishProcessing() {
         state = .idle
         activeCardId = nil
-    }
+        cleanupMarker()
 
-    // MARK: - Run Claude subprocess
-
-    private func runClaude(prompt: String) async -> String {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [self] in
-                let process = Process()
-                let stdout = Pipe()
-                let stderr = Pipe()
-
-                // Build args matching Node.js: claude -p <prompt> --output-format stream-json --verbose
-                var args = ["claude", "-p", prompt,
-                            "--output-format", "stream-json",
-                            "--verbose",
-                            "--model", "bedrock-claude-4-6-opus",
-                            "--dangerously-skip-permissions"]
-
-                if let sessionId = claudeSessionId {
-                    args.append(contentsOf: ["--resume", sessionId])
-                }
-
-                process.executableURL = URL(fileURLWithPath: "/Users/user/.local/bin/codemax")
-                process.arguments = args
-                process.currentDirectoryURL = URL(fileURLWithPath: workDir)
-                process.standardOutput = stdout
-                process.standardError = stderr
-
-                // Add environment for non-interactive
-                var env = ProcessInfo.processInfo.environment
-                env["TERM"] = "dumb"
-                env["NO_COLOR"] = "1"
-                process.environment = env
-
-                currentProcess = process
-
-                var textBuffer = ""
-                var sessionIdCaptured = false
-
-                // Read stdout incrementally
-                let readQueue = DispatchQueue(label: "wea.claude.stdout.\(sessionKey)")
-                var lineBuf = ""
-
-                stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                    let data = handle.availableData
-                    guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-
-                    readQueue.sync {
-                        lineBuf += chunk
-                        while let idx = lineBuf.firstIndex(of: "\n") {
-                            let line = String(lineBuf[lineBuf.startIndex..<idx]).trimmingCharacters(in: .whitespaces)
-                            lineBuf = String(lineBuf[lineBuf.index(after: idx)...])
-                            guard !line.isEmpty else { continue }
-
-                            self?.processJsonLine(line, textBuffer: &textBuffer, sessionIdCaptured: &sessionIdCaptured)
-                        }
-                    }
-                }
-
-                // Timeout after 5 minutes
-                let timeoutItem = DispatchWorkItem { [weak process] in
-                    weaLog("[Bridge] Claude process timed out, killing")
-                    process?.terminate()
-                }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 300, execute: timeoutItem)
-
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-                } catch {
-                    weaLog("[Bridge:\(self.sessionKey)] Failed to launch Claude: \(error)")
-                    continuation.resume(returning: "")
-                    return
-                }
-
-                timeoutItem.cancel()
-                currentProcess = nil
-                stdout.fileHandleForReading.readabilityHandler = nil
-
-                // Process any remaining data in buffer
-                readQueue.sync {
-                    if let remaining = try? stdout.fileHandleForReading.availableData,
-                       !remaining.isEmpty,
-                       let chunk = String(data: remaining, encoding: .utf8) {
-                        lineBuf += chunk
-                    }
-                    for line in lineBuf.split(separator: "\n") {
-                        let trimmed = String(line).trimmingCharacters(in: .whitespaces)
-                        guard !trimmed.isEmpty else { continue }
-                        self.processJsonLine(trimmed, textBuffer: &textBuffer, sessionIdCaptured: &sessionIdCaptured)
-                    }
-                }
-
-                let exitCode = process.terminationStatus
-                weaLog("[Bridge:\(self.sessionKey)] Claude exited with code \(exitCode), text=\(textBuffer.count) chars")
-
-                if let stderrData = try? stderr.fileHandleForReading.readDataToEndOfFile(),
-                   let stderrStr = String(data: stderrData, encoding: .utf8),
-                   !stderrStr.isEmpty {
-                    weaLog("[Bridge:\(self.sessionKey)] stderr: \(stderrStr.prefix(500))")
-                }
-
-                let finalText = textBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-                continuation.resume(returning: finalText)
+        // Process next queued message
+        if let next = pendingMessages.first {
+            pendingMessages.removeFirst()
+            Task {
+                await doInjectMessage(next)
             }
         }
     }
 
-    /// Parse a stream-json line from Claude CLI output
-    private func processJsonLine(_ line: String, textBuffer: inout String, sessionIdCaptured: inout Bool) {
-        guard let data = line.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return
-        }
+    // MARK: - Read full assistant message from transcript
 
-        let type = obj["type"] as? String ?? ""
+    private func readLastAssistantMessage(from path: String) -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let content = String(data: data, encoding: .utf8) else { return nil }
 
-        switch type {
-        case "assistant":
-            // Extract text from content blocks
-            if let message = obj["message"] as? [String: Any],
-               let content = message["content"] as? [[String: Any]] {
-                for block in content {
-                    if (block["type"] as? String) == "text",
-                       let text = block["text"] as? String {
-                        textBuffer += text
-                        throttledRefresh(textBuffer)
-                    }
+        var lastText: String?
+        for line in content.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let lineData = trimmed.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let message = obj["message"] as? [String: Any],
+                  let role = message["role"] as? String,
+                  role == "assistant" else { continue }
+
+            if let contentArr = message["content"] as? [[String: Any]] {
+                let texts = contentArr.compactMap { block -> String? in
+                    guard (block["type"] as? String) == "text",
+                          let t = block["text"] as? String else { return nil }
+                    return t
                 }
+                let joined = texts.joined(separator: "\n")
+                if !joined.isEmpty { lastText = joined }
+            } else if let contentStr = message["content"] as? String, !contentStr.isEmpty {
+                lastText = contentStr
             }
-
-        case "content_block_delta":
-            // Streaming text delta
-            if let delta = obj["delta"] as? [String: Any],
-               (delta["type"] as? String) == "text_delta",
-               let text = delta["text"] as? String {
-                textBuffer += text
-                throttledRefresh(textBuffer)
-            }
-
-        case "result":
-            // Final result — capture session ID
-            if !sessionIdCaptured, let sessionId = obj["session_id"] as? String {
-                claudeSessionId = sessionId
-                sessionIdCaptured = true
-                saveSessionId(sessionId)
-                weaLog("[Bridge:\(sessionKey)] Captured session ID: \(sessionId)")
-            }
-            // Fallback result text
-            if textBuffer.isEmpty, let resultText = obj["result"] as? String {
-                textBuffer = resultText
-            }
-
-        case "system":
-            // Log but ignore
-            break
-
-        default:
-            break
         }
+        return lastText
     }
 
-    /// Throttled card refresh while Claude is streaming
-    private func throttledRefresh(_ content: String) {
-        let now = Date()
-        guard now.timeIntervalSince(lastRefreshTime) >= refreshThrottleInterval,
-              let cardId = activeCardId,
-              !content.isEmpty else { return }
+    // MARK: - Marker file for hook discrimination
 
-        lastRefreshTime = now
-        let client = httpClient
-        let destination = dest
-        let text = content
-        Task {
-            try? await client.refreshCard(cardId: cardId, content: text, dest: destination)
-        }
+    private func writeMarker() {
+        FileManager.default.createFile(atPath: weaActiveMarkerPath, contents: Data())
     }
 
-    private func saveSessionId(_ id: String) {
-        let path = workDir + "/.claude-session-id"
-        try? id.write(toFile: path, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Legacy API (kept for WeaBotService compat)
-
-    func injectQuestionReply(_ reply: String) {
-        // Not applicable in one-shot mode
-    }
-
-    func onClaudeStop(transcriptPath: String?, lastMessage: String?) async {
-        // Not needed — process exit handles completion
-    }
-
-    func onNeedsInput(question: String) async {
-        // Not applicable in one-shot mode
-    }
-
-    func onAskUserQuestion(questionText: String) async {
-        // Not applicable in one-shot mode
-    }
-
-    func startTranscriptWatch(path: String) {
-        // Not needed — we read stdout directly
+    private func cleanupMarker() {
+        try? FileManager.default.removeItem(atPath: weaActiveMarkerPath)
     }
 }

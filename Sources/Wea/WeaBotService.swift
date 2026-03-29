@@ -3,7 +3,7 @@ import Foundation
 import os
 
 /// Central orchestrator for WEA bot functionality.
-/// Manages the WebSocket connection, routes messages to Claude subprocesses.
+/// Manages the WebSocket connection, routes messages, creates/manages terminal bridges.
 @MainActor
 final class WeaBotService: ObservableObject {
     static let shared = WeaBotService()
@@ -19,9 +19,17 @@ final class WeaBotService: ObservableObject {
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaBotService")
     private let webSocket = WeaWebSocket()
     private var httpClient: WeaHttpClient?
+    private var workspaceManager: WeaWorkspaceManager?
 
     @Published private(set) var state: ServiceState = .stopped
     private var bridges: [String: WeaTerminalBridge] = [:]  // sessionKey → bridge
+
+    /// Callback to create a new group chat tab. Set by the UI layer.
+    var onCreateGroupTab: ((_ groupId: String, _ groupName: String) -> TerminalPanel?)?
+    /// Callback to get the main DM tab's panel.
+    var onGetMainPanel: (() -> TerminalPanel?)?
+    /// Reference to the TabManager for workspace management.
+    weak var tabManager: TabManager?
 
     private init() {
         webSocket.onMessage = { [weak self] payload in
@@ -35,6 +43,7 @@ final class WeaBotService: ObservableObject {
                 switch wsState {
                 case .connected:
                     self.state = .running
+                    self.createWeaWorkspaceIfNeeded()
                 case .connecting: self.state = .connecting
                 case .reconnecting: self.state = .reconnecting
                 case .disconnected:
@@ -64,7 +73,18 @@ final class WeaBotService: ObservableObject {
         webSocket.disconnect()
         bridges.removeAll()
         httpClient = nil
+        workspaceManager?.destroyWeaWorkspace()
+        workspaceManager = nil
         state = .stopped
+    }
+
+    /// Creates the "wea" sidebar workspace with a Claude session when first connected.
+    private func createWeaWorkspaceIfNeeded() {
+        guard let tabManager, workspaceManager == nil else { return }
+        let manager = WeaWorkspaceManager(tabManager: tabManager)
+        manager.createWeaWorkspace()
+        workspaceManager = manager
+        logger.info("Auto-created wea workspace on connect")
     }
 
     // MARK: - Message Routing
@@ -125,19 +145,80 @@ final class WeaBotService: ObservableObject {
             bridges[sessionKey] = bridge
         }
 
-        Task {
-            await bridge.injectMessage(message.text)
+        // If bridge is waiting for input (question reply), treat this as a reply
+        if bridge.state == .waitingInput {
+            bridge.injectQuestionReply(message.text)
+        } else {
+            Task {
+                await bridge.injectMessage(message.text)
+            }
         }
     }
 
     private func createBridge(sessionKey: String, message: WeaParsedMessage) -> WeaTerminalBridge? {
         guard let httpClient else { return nil }
         let dest = WeaMessageParser.replyDest(for: message)
+        let panel: TerminalPanel?
+
+        if message.chatType == .directMessage {
+            panel = onGetMainPanel?()
+        } else {
+            let groupName = message.senderName ?? message.groupId ?? "Group"
+            panel = onCreateGroupTab?(message.groupId!, groupName)
+        }
+
+        guard let panel else { return nil }
         return WeaTerminalBridge(
             sessionKey: sessionKey,
+            panel: panel,
             httpClient: httpClient,
             dest: dest
         )
+    }
+
+    // MARK: - Hook Integration
+
+    /// Called by claude-hook handler when Stop fires on a WEA session.
+    func handleClaudeStop(workspaceId: String, transcriptPath: String?, lastMessage: String?) {
+        for bridge in bridges.values {
+            guard bridge.isWeaMessageActive else { continue }
+            Task {
+                await bridge.onClaudeStop(transcriptPath: transcriptPath, lastMessage: lastMessage)
+            }
+            return
+        }
+    }
+
+    /// Called by claude-hook handler when Notification fires.
+    func handleClaudeNotification(workspaceId: String, question: String) {
+        for bridge in bridges.values {
+            guard bridge.isWeaMessageActive else { continue }
+            Task {
+                await bridge.onNeedsInput(question: question)
+            }
+            return
+        }
+    }
+
+    /// Called by claude-hook when PreToolUse(AskUserQuestion) fires.
+    func handleAskUserQuestion(workspaceId: String, questionText: String) {
+        for bridge in bridges.values {
+            guard bridge.isWeaMessageActive else { continue }
+            Task {
+                await bridge.onAskUserQuestion(questionText: questionText)
+            }
+            return
+        }
+    }
+
+    /// Called by claude-hook when SessionStart fires (to begin transcript watch).
+    func handleSessionStart(workspaceId: String, transcriptPath: String?) {
+        guard let transcriptPath else { return }
+        for bridge in bridges.values {
+            guard bridge.isWeaMessageActive else { continue }
+            bridge.startTranscriptWatch(path: transcriptPath)
+            return
+        }
     }
 
     // MARK: - Session Management
