@@ -54,11 +54,14 @@ final class WeaWebSocket: NSObject {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
-        weaLog("[WeaWebSocket] Connecting to wss://openapi.difft.org/v1/websocket appId=\(appId)")
+        weaLog("[WeaWebSocket] Connecting to wss://openapi.difft.org/v1/websocket")
+        weaLog("[WeaWebSocket] appId=\(appId) secretLen=\(appSecret.count) secretPrefix=\(String(appSecret.prefix(4)))")
         weaLog("[WeaWebSocket] Headers: \(signed.httpHeaders)")
+        weaLog("[WeaWebSocket] Request allHTTPHeaderFields: \(request.allHTTPHeaderFields ?? [:])")
 
         session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         webSocketTask = session?.webSocketTask(with: request)
+        weaLog("[WeaWebSocket] Task originalRequest headers: \(webSocketTask?.originalRequest?.allHTTPHeaderFields ?? [:])")
         webSocketTask?.resume()
     }
 
