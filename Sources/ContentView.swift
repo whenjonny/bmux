@@ -11818,7 +11818,7 @@ private struct TabItemView: View, Equatable {
         .disabled(targetIds.isEmpty)
 
         // WEA Bot workspace actions
-        if tab.title == "main-wea" && WeaBotService.shared.isRunning {
+        if tab.title == "wea" && WeaBotService.shared.isRunning {
             Divider()
             Button(String(localized: "contextMenu.disconnectWeaBot", defaultValue: "Disconnect WEA Bot")) {
                 WeaBotService.shared.stop()

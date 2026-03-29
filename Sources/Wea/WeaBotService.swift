@@ -19,6 +19,7 @@ final class WeaBotService: ObservableObject {
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaBotService")
     private let webSocket = WeaWebSocket()
     private var httpClient: WeaHttpClient?
+    private var workspaceManager: WeaWorkspaceManager?
 
     @Published private(set) var state: ServiceState = .stopped
     private var bridges: [String: WeaTerminalBridge] = [:]  // sessionKey → bridge
@@ -40,7 +41,9 @@ final class WeaBotService: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 switch wsState {
-                case .connected: self.state = .running
+                case .connected:
+                    self.state = .running
+                    self.createWeaWorkspaceIfNeeded()
                 case .connecting: self.state = .connecting
                 case .reconnecting: self.state = .reconnecting
                 case .disconnected:
@@ -73,7 +76,18 @@ final class WeaBotService: ObservableObject {
         }
         bridges.removeAll()
         httpClient = nil
+        workspaceManager?.destroyWeaWorkspace()
+        workspaceManager = nil
         state = .stopped
+    }
+
+    /// Creates the "wea" sidebar workspace with a Claude session when first connected.
+    private func createWeaWorkspaceIfNeeded() {
+        guard let tabManager, workspaceManager == nil else { return }
+        let manager = WeaWorkspaceManager(tabManager: tabManager)
+        manager.createWeaWorkspace()
+        workspaceManager = manager
+        logger.info("Auto-created wea workspace on connect")
     }
 
     // MARK: - Message Routing

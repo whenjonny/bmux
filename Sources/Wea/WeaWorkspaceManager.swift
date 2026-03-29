@@ -2,7 +2,7 @@
 import Foundation
 import os
 
-/// Manages the main-wea workspace and its tabs.
+/// Manages the wea workspace and its tabs.
 /// Creates workspace on connect, destroys on disconnect, spawns group chat tabs.
 @MainActor
 final class WeaWorkspaceManager {
@@ -34,12 +34,12 @@ final class WeaWorkspaceManager {
     func createWeaWorkspace() {
         guard let tabManager else { return }
         let workspace = tabManager.addWorkspace(
-            title: "main-wea",
-            initialTerminalCommand: "codemax claude --dangerously-skip-permissions",
+            title: "wea",
+            initialTerminalCommand: "codemax claude --allow-dangerously-skip-permissions",
             select: true
         )
         weaWorkspace = workspace
-        logger.info("Created main-wea workspace: \(workspace.id)")
+        logger.info("Created wea workspace: \(workspace.id)")
     }
 
     func destroyWeaWorkspace() {
@@ -47,7 +47,7 @@ final class WeaWorkspaceManager {
         tabManager.closeWorkspaceWithConfirmation(workspace)
         weaWorkspace = nil
         groupPanels.removeAll()
-        logger.info("Destroyed main-wea workspace")
+        logger.info("Destroyed wea workspace")
     }
 
     // MARK: - Panel Access
