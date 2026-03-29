@@ -11341,11 +11341,18 @@ struct CMUXCLI {
             )
             print("OK")
 
+        case "post-tool-use":
+            telemetry.breadcrumb("claude-hook.post-tool-use")
+            // Async hook: notifies WeaBotService for streaming progress updates.
+            // The WEA transcript watcher (DispatchSource) handles streaming automatically.
+            // This hook serves as a checkpoint for future WEA progress reporting.
+            print("OK")
+
         case "help", "--help", "-h":
             telemetry.breadcrumb("claude-hook.help")
             print(
                 """
-                cmux claude-hook <session-start|stop|session-end|notification|prompt-submit|pre-tool-use> [--workspace <id|index>] [--surface <id|index>]
+                cmux claude-hook <session-start|stop|session-end|notification|prompt-submit|pre-tool-use|post-tool-use> [--workspace <id|index>] [--surface <id|index>]
                 """
             )
 

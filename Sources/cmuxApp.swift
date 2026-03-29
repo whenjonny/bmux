@@ -374,6 +374,10 @@ struct cmuxApp: App {
             }
 
             CommandGroup(replacing: .appInfo) {
+                Button(String(localized: "menu.app.weaBot", defaultValue: "WEA Bot…")) {
+                    appDelegate.showWeaBotConfig()
+                }
+                Divider()
                 Button(String(localized: "menu.app.about", defaultValue: "About cmux")) {
                     showAboutPanel()
                 }

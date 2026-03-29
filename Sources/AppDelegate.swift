@@ -6273,6 +6273,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         openPreferencesWindow(debugSource: "appDelegate")
     }
 
+    @MainActor
+    func showWeaBotConfig() {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 400),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = String(localized: "weaBot.config.title", defaultValue: "WEA Bot Configuration")
+        panel.contentView = NSHostingView(rootView: WeaBotConfigSheet())
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+    }
+
     func refreshMenuBarExtraForDebug() {
         menuBarExtraController?.refreshForDebugControls()
     }
