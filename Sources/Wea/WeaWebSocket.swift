@@ -42,6 +42,9 @@ final class WeaWebSocket: NSObject {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
+        NSLog("[WeaWebSocket] Connecting to wss://openapi.difft.org/v1/websocket appId=\(appId)")
+        NSLog("[WeaWebSocket] Headers: \(signed.httpHeaders)")
+
         session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         webSocketTask = session?.webSocketTask(with: request)
         webSocketTask?.resume()
@@ -152,6 +155,7 @@ extension WeaWebSocket: URLSessionWebSocketDelegate {
         webSocketTask: URLSessionWebSocketTask,
         didOpenWithProtocol protocol: String?
     ) {
+        NSLog("[WeaWebSocket] WebSocket connected")
         DispatchQueue.main.async { [weak self] in
             self?.onConnected()
         }
@@ -164,12 +168,29 @@ extension WeaWebSocket: URLSessionWebSocketDelegate {
         didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
         reason: Data?
     ) {
+        let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "none"
+        NSLog("[WeaWebSocket] WebSocket closed: code=\(closeCode.rawValue) reason=\(reasonStr)")
         DispatchQueue.main.async { [weak self] in
             if closeCode.rawValue == 1008 {
-                self?.logger.error("WEA rejected connection (1008), not reconnecting")
                 self?.state = .disconnected
             } else {
                 self?.scheduleReconnect()
+            }
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error {
+            NSLog("[WeaWebSocket] Connection failed: \(error.localizedDescription)")
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.onStateChange?(.disconnected)
+                // Report error to service
+                WeaBotService.shared.reportConnectionError(error.localizedDescription)
             }
         }
     }

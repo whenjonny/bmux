@@ -235,4 +235,9 @@ final class WeaBotService: ObservableObject {
     }
 
     var isRunning: Bool { state == .running }
+
+    /// Called by WeaWebSocket when the connection fails with an error.
+    func reportConnectionError(_ message: String) {
+        state = .error(message)
+    }
 }
