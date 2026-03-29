@@ -32,22 +32,20 @@ final class WeaTerminalBridge {
     var isWeaMessageActive: Bool { state == .processing || state == .waitingInput }
 
     /// Flag file used by hooks to detect WEA-originated prompts.
-    var weaActiveMarkerPath: String {
-        let dir = NSTemporaryDirectory()
-        let safe = sessionKey.replacingOccurrences(of: ":", with: "_")
-        return "\(dir)cmux-wea-active-\(safe)"
-    }
+    nonisolated let weaActiveMarkerPath: String
 
     init(sessionKey: String, panel: TerminalPanel, httpClient: WeaHttpClient, dest: WeaMessageDest) {
         self.sessionKey = sessionKey
         self.panel = panel
         self.httpClient = httpClient
         self.dest = dest
+        let safe = sessionKey.replacingOccurrences(of: ":", with: "_")
+        self.weaActiveMarkerPath = "\(NSTemporaryDirectory())cmux-wea-active-\(safe)"
     }
 
     deinit {
-        stopTranscriptWatch()
-        cleanupMarker()
+        transcriptWatcher?.cancel()
+        try? FileManager.default.removeItem(atPath: weaActiveMarkerPath)
     }
 
     // MARK: - Inject WEA message into terminal

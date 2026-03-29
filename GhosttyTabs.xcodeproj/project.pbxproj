@@ -128,7 +128,16 @@
 					8C4BBF2DEF6DF93F395A9EE7 /* TerminalControllerSocketSecurityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 491751CE2321474474F27DCF /* TerminalControllerSocketSecurityTests.swift */; };
 					2BB56A710BB1FC50367E5BCF /* TabManagerSessionSnapshotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10D684CFFB8CDEF89CE2D9E1 /* TabManagerSessionSnapshotTests.swift */; };
 					C1A2B3C4D5E6F70800000001 /* CmuxConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A2B3C4D5E6F70800000002 /* CmuxConfigTests.swift */; };
-		/* End PBXBuildFile section */
+			WEA00001A1B2C3D4E5F60001 /* WeaBotConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60010 /* WeaBotConfig.swift */; };
+		WEA00001A1B2C3D4E5F60002 /* WeaSignature.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60020 /* WeaSignature.swift */; };
+		WEA00001A1B2C3D4E5F60003 /* WeaMessageParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60030 /* WeaMessageParser.swift */; };
+		WEA00001A1B2C3D4E5F60004 /* WeaWebSocket.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60040 /* WeaWebSocket.swift */; };
+		WEA00001A1B2C3D4E5F60005 /* WeaHttpClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60050 /* WeaHttpClient.swift */; };
+		WEA00001A1B2C3D4E5F60006 /* WeaTerminalBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60060 /* WeaTerminalBridge.swift */; };
+		WEA00001A1B2C3D4E5F60007 /* WeaBotService.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60070 /* WeaBotService.swift */; };
+		WEA00001A1B2C3D4E5F60008 /* WeaBotConfigSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60080 /* WeaBotConfigSheet.swift */; };
+		WEA00001A1B2C3D4E5F60009 /* WeaWorkspaceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60090 /* WeaWorkspaceManager.swift */; };
+	/* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
 		A5001020 /* Embed Frameworks */ = {
@@ -302,6 +311,15 @@
 				491751CE2321474474F27DCF /* TerminalControllerSocketSecurityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalControllerSocketSecurityTests.swift; sourceTree = "<group>"; };
 				10D684CFFB8CDEF89CE2D9E1 /* TabManagerSessionSnapshotTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabManagerSessionSnapshotTests.swift; sourceTree = "<group>"; };
 				C1A2B3C4D5E6F70800000002 /* CmuxConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CmuxConfigTests.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F60010 /* WeaBotConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaBotConfig.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F60020 /* WeaSignature.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaSignature.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F60030 /* WeaMessageParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaMessageParser.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F60040 /* WeaWebSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaWebSocket.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F60050 /* WeaHttpClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaHttpClient.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F60060 /* WeaTerminalBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaTerminalBridge.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F60070 /* WeaBotService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaBotService.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F60080 /* WeaBotConfigSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaBotConfigSheet.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F60090 /* WeaWorkspaceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaWorkspaceManager.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -471,6 +489,15 @@
 				A5001651 /* CmuxConfig.swift */,
 				A5001653 /* CmuxConfigExecutor.swift */,
 				A5001655 /* CmuxDirectoryTrust.swift */,
+				WEA00001A1B2C3D4E5F60010 /* WeaBotConfig.swift */,
+				WEA00001A1B2C3D4E5F60020 /* WeaSignature.swift */,
+				WEA00001A1B2C3D4E5F60030 /* WeaMessageParser.swift */,
+				WEA00001A1B2C3D4E5F60040 /* WeaWebSocket.swift */,
+				WEA00001A1B2C3D4E5F60050 /* WeaHttpClient.swift */,
+				WEA00001A1B2C3D4E5F60060 /* WeaTerminalBridge.swift */,
+				WEA00001A1B2C3D4E5F60070 /* WeaBotService.swift */,
+				WEA00001A1B2C3D4E5F60080 /* WeaBotConfigSheet.swift */,
+				WEA00001A1B2C3D4E5F60090 /* WeaWorkspaceManager.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -713,6 +740,15 @@
 				buildActionMask = 2147483647;
 				files = (
 					A5001001 /* cmuxApp.swift in Sources */,
+					WEA00001A1B2C3D4E5F60001 /* WeaBotConfig.swift in Sources */,
+					WEA00001A1B2C3D4E5F60002 /* WeaSignature.swift in Sources */,
+					WEA00001A1B2C3D4E5F60003 /* WeaMessageParser.swift in Sources */,
+					WEA00001A1B2C3D4E5F60004 /* WeaWebSocket.swift in Sources */,
+					WEA00001A1B2C3D4E5F60005 /* WeaHttpClient.swift in Sources */,
+					WEA00001A1B2C3D4E5F60006 /* WeaTerminalBridge.swift in Sources */,
+					WEA00001A1B2C3D4E5F60007 /* WeaBotService.swift in Sources */,
+					WEA00001A1B2C3D4E5F60008 /* WeaBotConfigSheet.swift in Sources */,
+					WEA00001A1B2C3D4E5F60009 /* WeaWorkspaceManager.swift in Sources */,
 					A5001002 /* ContentView.swift in Sources */,
 					E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */,
 					B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */,

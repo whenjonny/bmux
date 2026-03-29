@@ -17,77 +17,83 @@ struct WeaBotConfigSheet: View {
                 statusBadge
             }
 
-            SettingsCard {
-                SettingsCardRow(
-                    String(localized: "weaBot.config.appId", defaultValue: "App ID")
-                ) {
-                    TextField("", text: $config.appId)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 220)
-                }
+            GroupBox {
+                VStack(spacing: 0) {
+                    fieldRow(
+                        label: String(localized: "weaBot.config.appId", defaultValue: "App ID")
+                    ) {
+                        TextField("", text: $config.appId)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 220)
+                    }
 
-                SettingsCardDivider()
+                    Divider()
 
-                SettingsCardRow(
-                    String(localized: "weaBot.config.appSecret", defaultValue: "App Secret")
-                ) {
-                    SecureField("", text: $appSecret)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 220)
-                        .onChange(of: appSecret) { newValue in
-                            if !newValue.isEmpty {
-                                config.saveSecret(newValue)
+                    fieldRow(
+                        label: String(localized: "weaBot.config.appSecret", defaultValue: "App Secret")
+                    ) {
+                        SecureField("", text: $appSecret)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 220)
+                            .onChange(of: appSecret) { newValue in
+                                if !newValue.isEmpty {
+                                    config.saveSecret(newValue)
+                                }
                             }
-                        }
-                }
+                    }
 
-                SettingsCardDivider()
+                    Divider()
 
-                SettingsCardRow(
-                    String(localized: "weaBot.config.botId", defaultValue: "Bot ID")
-                ) {
-                    TextField("", text: $config.botId)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 220)
-                }
+                    fieldRow(
+                        label: String(localized: "weaBot.config.botId", defaultValue: "Bot ID")
+                    ) {
+                        TextField("", text: $config.botId)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 220)
+                    }
 
-                SettingsCardDivider()
+                    Divider()
 
-                SettingsCardRow(
-                    String(localized: "weaBot.config.autoConnect", defaultValue: "Auto-connect on Launch")
-                ) {
-                    Toggle("", isOn: $config.autoConnect)
-                        .labelsHidden()
+                    fieldRow(
+                        label: String(localized: "weaBot.config.autoConnect", defaultValue: "Auto-connect on Launch")
+                    ) {
+                        Toggle("", isOn: $config.autoConnect)
+                            .labelsHidden()
+                    }
                 }
             }
 
             // Group Blacklist
             if !config.knownGroups.isEmpty {
-                SettingsSectionHeader(
-                    title: String(localized: "weaBot.config.blacklist", defaultValue: "Group Blacklist")
-                )
-                SettingsCard {
-                    ForEach(Array(config.knownGroups.sorted(by: { $0.value < $1.value })), id: \.key) { groupId, groupName in
-                        HStack {
-                            Text(groupName)
-                            Spacer()
-                            Toggle("", isOn: Binding(
-                                get: { config.isBlacklisted(groupId) },
-                                set: { blocked in
-                                    if blocked {
-                                        config.addToBlacklist(groupId)
-                                    } else {
-                                        config.removeFromBlacklist(groupId)
-                                    }
-                                }
-                            ))
-                            .labelsHidden()
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
+                Text(String(localized: "weaBot.config.blacklist", defaultValue: "Group Blacklist"))
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
 
-                        if groupId != config.knownGroups.sorted(by: { $0.value < $1.value }).last?.key {
-                            SettingsCardDivider()
+                GroupBox {
+                    VStack(spacing: 0) {
+                        let sorted = config.knownGroups.sorted(by: { $0.value < $1.value })
+                        ForEach(Array(sorted.enumerated()), id: \.element.key) { index, item in
+                            HStack {
+                                Text(item.value)
+                                Spacer()
+                                Toggle("", isOn: Binding(
+                                    get: { config.isBlacklisted(item.key) },
+                                    set: { blocked in
+                                        if blocked {
+                                            config.addToBlacklist(item.key)
+                                        } else {
+                                            config.removeFromBlacklist(item.key)
+                                        }
+                                    }
+                                ))
+                                .labelsHidden()
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+
+                            if index < sorted.count - 1 {
+                                Divider()
+                            }
                         }
                     }
                 }
@@ -117,11 +123,20 @@ struct WeaBotConfigSheet: View {
         .padding(20)
         .frame(minWidth: 440)
         .onAppear {
-            // Load existing secret for display (masked)
             if config.loadSecret() != nil {
                 appSecret = "••••••••"
             }
         }
+    }
+
+    private func fieldRow<Content: View>(label: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack {
+            Text(label)
+                .frame(width: 140, alignment: .trailing)
+            content()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
     }
 
     @ViewBuilder
