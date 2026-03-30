@@ -2736,6 +2736,15 @@ class GhosttyApp {
                 #endif
                 return false
             }
+            // Cmd+Shift+Click: always open in the system browser.
+            if surfaceView.forceExternalLinkOpen {
+                #if DEBUG
+                dlog("link.openURL Cmd+Shift+Click, forcing external open url=\(target.url)")
+                #endif
+                return performOnMain {
+                    NSWorkspace.shared.open(target.url)
+                }
+            }
             if !BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowser() {
                 #if DEBUG
                 dlog("link.openURL cmuxBrowser=disabled, opening externally url=\(target.url)")
@@ -4412,6 +4421,10 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     private var _scrollbarFlushScheduled = false
     private let _scrollbarLock = NSLock()
     var cellSize: CGSize = .zero
+
+    /// When true, the current OPEN_URL action was triggered by Cmd+Shift+Click
+    /// and should always open in the system browser instead of the embedded browser.
+    fileprivate var forceExternalLinkOpen = false
 
     /// Coalesce high-frequency scrollbar updates into a single main-thread
     /// dispatch.  The action callback (which may fire thousands of times per
@@ -6158,7 +6171,9 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         var keyEvent = ghostty_input_key_s()
         keyEvent.action = GHOSTTY_ACTION_PRESS
         keyEvent.keycode = UInt32(event.keyCode)
-        keyEvent.mods = modsFromEvent(event)
+        // Strip Shift when Cmd+Shift is held so the link highlight stays active.
+        keyEvent.mods = event.modifierFlags.contains([.command, .shift])
+            ? modsWithoutShift(event) : modsFromEvent(event)
         keyEvent.consumed_mods = GHOSTTY_MODS_NONE
         keyEvent.text = nil
         keyEvent.composing = false
@@ -6168,6 +6183,16 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     private func modsFromEvent(_ event: NSEvent) -> ghostty_input_mods_e {
         var mods = GHOSTTY_MODS_NONE.rawValue
         if event.modifierFlags.contains(.shift) { mods |= GHOSTTY_MODS_SHIFT.rawValue }
+        if event.modifierFlags.contains(.control) { mods |= GHOSTTY_MODS_CTRL.rawValue }
+        if event.modifierFlags.contains(.option) { mods |= GHOSTTY_MODS_ALT.rawValue }
+        if event.modifierFlags.contains(.command) { mods |= GHOSTTY_MODS_SUPER.rawValue }
+        return ghostty_input_mods_e(rawValue: mods)
+    }
+
+    /// Like `modsFromEvent` but omits the Shift bit. Used for Cmd+Shift+Click
+    /// so that Ghostty still treats the event as a Cmd-only link interaction.
+    private func modsWithoutShift(_ event: NSEvent) -> ghostty_input_mods_e {
+        var mods = GHOSTTY_MODS_NONE.rawValue
         if event.modifierFlags.contains(.control) { mods |= GHOSTTY_MODS_CTRL.rawValue }
         if event.modifierFlags.contains(.option) { mods |= GHOSTTY_MODS_ALT.rawValue }
         if event.modifierFlags.contains(.command) { mods |= GHOSTTY_MODS_SUPER.rawValue }
@@ -6389,12 +6414,14 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         }
         guard let surface = surface else { return }
         let point = convert(event.locationInWindow, from: nil)
+        let isCmdShift = event.modifierFlags.contains([.command, .shift])
+        let mods = isCmdShift ? modsWithoutShift(event) : modsFromEvent(event)
         // Only update mouse position on the first click to prevent unwanted cursor
         // movement during double-click selection (issue #1698)
         if event.clickCount == 1 {
-            ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, modsFromEvent(event))
+            ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, mods)
         }
-        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, modsFromEvent(event))
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -6402,7 +6429,14 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         dlog("terminal.mouseUp surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil") mods=[\(debugModifierString(event.modifierFlags))]")
         #endif
         guard let surface = surface else { return }
-        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, modsFromEvent(event))
+        // Cmd+Shift+Click: strip Shift so Ghostty detects the link as a normal
+        // Cmd+Click, then the OPEN_URL handler will see forceExternalLinkOpen
+        // and open in the system browser instead of the embedded browser.
+        let isCmdShift = event.modifierFlags.contains([.command, .shift])
+        if isCmdShift { forceExternalLinkOpen = true }
+        let mods = isCmdShift ? modsWithoutShift(event) : modsFromEvent(event)
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods)
+        forceExternalLinkOpen = false
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -6540,7 +6574,10 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         maybeRequestFirstResponderForMouseFocus()
         guard let surface = surface else { return }
         let point = convert(event.locationInWindow, from: nil)
-        ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, modsFromEvent(event))
+        // Strip Shift when Cmd+Shift is held so Ghostty still highlights the link.
+        let mods = event.modifierFlags.contains([.command, .shift])
+            ? modsWithoutShift(event) : modsFromEvent(event)
+        ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, mods)
     }
 
     override func mouseEntered(with event: NSEvent) {

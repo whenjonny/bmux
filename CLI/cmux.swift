@@ -437,6 +437,25 @@ private final class ClaudeHookSessionStore {
         }
     }
 
+    func allSessions() throws -> [ClaudeHookSessionRecord] {
+        try withLockedState { state in
+            Array(state.sessions.values)
+                .sorted(by: { $0.updatedAt > $1.updatedAt })
+        }
+    }
+
+    func bestMatch(workspaceId: String?, surfaceId: String?) throws -> ClaudeHookSessionRecord? {
+        let normalizedWorkspace = normalizeOptional(workspaceId)
+        let normalizedSurface = normalizeOptional(surfaceId)
+        return try withLockedState { state in
+            fallbackRecord(
+                sessions: Array(state.sessions.values),
+                workspaceId: normalizedWorkspace,
+                surfaceId: normalizedSurface
+            )
+        }
+    }
+
     private func fallbackRecord(
         sessions: [ClaudeHookSessionRecord],
         workspaceId: String?,
@@ -1480,11 +1499,27 @@ struct CMUXCLI {
         // Codex hooks management (no socket needed)
         if command == "codex" {
             let sub = commandArgs.first?.lowercased() ?? "help"
+            if sub == "help" || sub == "--help" || sub == "-h" {
+                if let text = subcommandUsage("codex") {
+                    print("cmux codex")
+                    print("")
+                    print(text)
+                    return
+                }
+            }
             if sub == "install-hooks" {
-                try runCodexInstallHooks()
+                let skipConfirm = commandArgs.contains("--yes") || commandArgs.contains("-y")
+                try runCodexInstallHooks(skipConfirm: skipConfirm)
                 return
             } else if sub == "uninstall-hooks" {
-                try runCodexUninstallHooks()
+                let skipConfirm = commandArgs.contains("--yes") || commandArgs.contains("-y")
+                try runCodexUninstallHooks(skipConfirm: skipConfirm)
+                return
+            } else if sub == "sync" {
+                try runCodexSync(commandArgs: Array(commandArgs.dropFirst()))
+                return
+            } else if sub == "show" {
+                try runCodexShow(commandArgs: Array(commandArgs.dropFirst()))
                 return
             }
         }
@@ -7152,13 +7187,15 @@ struct CMUXCLI {
             """
         case "codex":
             return """
-            Usage: cmux codex <install-hooks|uninstall-hooks>
+            Usage: cmux codex <install-hooks|uninstall-hooks|sync|show>
 
             Manage Codex CLI hooks integration.
 
             Subcommands:
               install-hooks     Install cmux hooks into ~/.codex/hooks.json
               uninstall-hooks   Remove cmux hooks from ~/.codex/hooks.json
+              sync              Sync cmux hooks + built-in skills to Codex/Claude config dirs
+              show              Show current hook/skill/session sync status
             """
         case "codex-hook":
             return """
@@ -12109,9 +12146,7 @@ struct CMUXCLI {
     /// Identifier used to detect cmux-owned hooks during uninstall.
     private static let codexHookCommandMarker = "cmux codex-hook"
 
-    private func runCodexInstallHooks() throws {
-        let skipConfirm = ProcessInfo.processInfo.arguments.contains("--yes")
-            || ProcessInfo.processInfo.arguments.contains("-y")
+    private func runCodexInstallHooks(skipConfirm: Bool = false) throws {
         let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
             ?? NSString(string: "~/.codex").expandingTildeInPath
         let hooksPath = (codexHome as NSString).appendingPathComponent("hooks.json")
@@ -12220,9 +12255,7 @@ struct CMUXCLI {
         print("To remove: cmux codex uninstall-hooks")
     }
 
-    private func runCodexUninstallHooks() throws {
-        let skipConfirm = ProcessInfo.processInfo.arguments.contains("--yes")
-            || ProcessInfo.processInfo.arguments.contains("-y")
+    private func runCodexUninstallHooks(skipConfirm: Bool = false) throws {
         let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
             ?? NSString(string: "~/.codex").expandingTildeInPath
         let hooksPath = (codexHome as NSString).appendingPathComponent("hooks.json")
@@ -12306,6 +12339,213 @@ struct CMUXCLI {
             try newConfigContent.write(toFile: configPath, atomically: true, encoding: .utf8)
         }
         print("Removed cmux Codex hooks.")
+    }
+
+    private func runCodexSync(commandArgs: [String]) throws {
+        if commandArgs.contains("--help") || commandArgs.contains("-h") {
+            print("Usage: cmux codex sync [--yes] [--quiet]")
+            print("  --yes   Skip confirmation prompt when installing hooks")
+            print("  --quiet Suppress sync summary output")
+            return
+        }
+        let quiet = commandArgs.contains("--quiet") || commandArgs.contains("-q")
+        let skipConfirm = commandArgs.contains("--yes") || commandArgs.contains("-y")
+        let repoSkillsRoot = resolveCmuxSkillsSourceRoot()
+        let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
+            ?? NSString(string: "~/.codex").expandingTildeInPath
+        let codexSkillsRoot = (codexHome as NSString).appendingPathComponent("skills")
+        let claudeSkillsRoot = (userHomeDirectory() as NSString).appendingPathComponent(".claude/skills")
+
+        try runCodexInstallHooks(skipConfirm: skipConfirm)
+
+        var syncedCodex = 0
+        var syncedClaude = 0
+        var sourceSummary = "none"
+        if let repoSkillsRoot {
+            sourceSummary = repoSkillsRoot
+            syncedCodex = try syncCmuxSkills(
+                from: repoSkillsRoot,
+                destinationRoot: codexSkillsRoot,
+                fileManager: .default
+            )
+            syncedClaude = try syncCmuxSkills(
+                from: repoSkillsRoot,
+                destinationRoot: claudeSkillsRoot,
+                fileManager: .default
+            )
+        }
+
+        if quiet {
+            return
+        }
+
+        print("Synced cmux agent integration:")
+        print("  codex hooks: installed")
+        print("  skills source: \(sourceSummary)")
+        print("  codex skills: \(syncedCodex) -> \(codexSkillsRoot)")
+        print("  claude skills: \(syncedClaude) -> \(claudeSkillsRoot)")
+    }
+
+    private func runCodexShow(commandArgs: [String]) throws {
+        let jsonOutput = commandArgs.contains("--json")
+        let env = ProcessInfo.processInfo.environment
+        let home = userHomeDirectory()
+        let codexHome = env["CODEX_HOME"] ?? NSString(string: "~/.codex").expandingTildeInPath
+        let hooksPath = (codexHome as NSString).appendingPathComponent("hooks.json")
+        let configPath = (codexHome as NSString).appendingPathComponent("config.toml")
+        let codexSkillsRoot = (codexHome as NSString).appendingPathComponent("skills")
+        let claudeSkillsRoot = (home as NSString).appendingPathComponent(".claude/skills")
+        let repoSkillsRoot = resolveCmuxSkillsSourceRoot()
+        let codexSessionStorePath = (home as NSString).appendingPathComponent(".cmuxterm/codex-hook-sessions.json")
+        let claudeSessionStorePath = (home as NSString).appendingPathComponent(".cmuxterm/claude-hook-sessions.json")
+        let hooksInstalled = codexHooksContainCmuxMarker(at: hooksPath)
+        let codexHooksEnabled = codexConfigEnablesHooks(at: configPath)
+        let codexSkillCount = countSyncedCmuxSkills(at: codexSkillsRoot)
+        let claudeSkillCount = countSyncedCmuxSkills(at: claudeSkillsRoot)
+        let codexSessionCount = (try? ClaudeHookSessionStore(
+            processEnv: ["CMUX_CLAUDE_HOOK_STATE_PATH": codexSessionStorePath]
+        ).allSessions().count) ?? 0
+        let claudeSessionCount = (try? ClaudeHookSessionStore(
+            processEnv: ["CMUX_CLAUDE_HOOK_STATE_PATH": claudeSessionStorePath]
+        ).allSessions().count) ?? 0
+
+        if jsonOutput {
+            let payload: [String: Any] = [
+                "codex_home": codexHome,
+                "hooks_path": hooksPath,
+                "config_path": configPath,
+                "repo_skills_path": repoSkillsRoot ?? NSNull(),
+                "hooks_installed": hooksInstalled,
+                "codex_hooks_enabled": codexHooksEnabled,
+                "codex_skills_path": codexSkillsRoot,
+                "claude_skills_path": claudeSkillsRoot,
+                "codex_skill_count": codexSkillCount,
+                "claude_skill_count": claudeSkillCount,
+                "codex_session_store_path": codexSessionStorePath,
+                "claude_session_store_path": claudeSessionStorePath,
+                "codex_session_count": codexSessionCount,
+                "claude_session_count": claudeSessionCount
+            ]
+            print(jsonString(payload))
+            return
+        }
+
+        print("cmux agent integration status:")
+        print("  codex home: \(codexHome)")
+        print("  hooks path: \(hooksPath) [\(hooksInstalled ? "installed" : "missing")]")
+        print("  config path: \(configPath) [codex_hooks=\(codexHooksEnabled ? "true" : "false")]")
+        print("  skills source: \(repoSkillsRoot ?? "not found (repo skills/ directory unavailable)")")
+        print("  codex skills: \(codexSkillCount) (\(codexSkillsRoot))")
+        print("  claude skills: \(claudeSkillCount) (\(claudeSkillsRoot))")
+        print("  codex sessions: \(codexSessionCount) (\(codexSessionStorePath))")
+        print("  claude sessions: \(claudeSessionCount) (\(claudeSessionStorePath))")
+        if !(hooksInstalled && codexHooksEnabled) {
+            print("  hint: run `cmux codex sync --yes`")
+        }
+    }
+
+    private func resolveCmuxSkillsSourceRoot() -> String? {
+        let fm = FileManager.default
+        var candidates: [String] = []
+
+        let cwdCandidate = (fm.currentDirectoryPath as NSString).appendingPathComponent("skills")
+        candidates.append(cwdCandidate)
+
+        if let executable = resolvedExecutableURL() {
+            var cursor = executable.deletingLastPathComponent()
+            for _ in 0..<8 {
+                candidates.append(cursor.appendingPathComponent("skills", isDirectory: true).path)
+                let parent = cursor.deletingLastPathComponent()
+                if parent.path == cursor.path { break }
+                cursor = parent
+            }
+        }
+
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent("skills", isDirectory: true).path)
+        }
+
+        for candidate in candidates {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: candidate, isDirectory: &isDir), isDir.boolValue {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func userHomeDirectory() -> String {
+        if let envHome = ProcessInfo.processInfo.environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envHome.isEmpty {
+            return envHome
+        }
+        return NSHomeDirectory()
+    }
+
+    private func syncCmuxSkills(
+        from sourceRoot: String,
+        destinationRoot: String,
+        fileManager fm: FileManager = .default
+    ) throws -> Int {
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: sourceRoot, isDirectory: &isDir), isDir.boolValue else {
+            return 0
+        }
+
+        try fm.createDirectory(atPath: destinationRoot, withIntermediateDirectories: true, attributes: nil)
+        let entries = try fm.contentsOfDirectory(atPath: sourceRoot)
+        var syncedCount = 0
+
+        for entry in entries.sorted() {
+            let sourceDir = (sourceRoot as NSString).appendingPathComponent(entry)
+            var sourceIsDir: ObjCBool = false
+            guard fm.fileExists(atPath: sourceDir, isDirectory: &sourceIsDir), sourceIsDir.boolValue else {
+                continue
+            }
+            let skillManifest = (sourceDir as NSString).appendingPathComponent("SKILL.md")
+            guard fm.fileExists(atPath: skillManifest) else { continue }
+
+            let destinationDir = (destinationRoot as NSString).appendingPathComponent(entry)
+            if fm.fileExists(atPath: destinationDir) {
+                try fm.removeItem(atPath: destinationDir)
+            }
+            try fm.copyItem(atPath: sourceDir, toPath: destinationDir)
+            syncedCount += 1
+        }
+
+        return syncedCount
+    }
+
+    private func codexHooksContainCmuxMarker(at hooksPath: String) -> Bool {
+        guard let content = try? String(contentsOfFile: hooksPath, encoding: .utf8) else {
+            return false
+        }
+        return content.contains(Self.codexHookCommandMarker)
+    }
+
+    private func codexConfigEnablesHooks(at configPath: String) -> Bool {
+        guard let content = try? String(contentsOfFile: configPath, encoding: .utf8) else {
+            return false
+        }
+        return content
+            .components(separatedBy: .newlines)
+            .contains(where: { isTomlKey($0, key: "codex_hooks") && $0.contains("true") })
+    }
+
+    private func countSyncedCmuxSkills(at skillsRoot: String) -> Int {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: skillsRoot) else {
+            return 0
+        }
+        return entries.filter { entry in
+            let candidate = (skillsRoot as NSString).appendingPathComponent(entry)
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: candidate, isDirectory: &isDir), isDir.boolValue else {
+                return false
+            }
+            let manifest = (candidate as NSString).appendingPathComponent("SKILL.md")
+            return fm.fileExists(atPath: manifest)
+        }.count
     }
 
     /// Print a unified-diff-style view with context lines and line numbers.
@@ -12998,7 +13238,7 @@ struct CMUXCLI {
           themes [list|set|clear]
           claude-teams [claude-args...]
           omo [opencode-args...]
-          codex <install-hooks|uninstall-hooks>
+          codex <install-hooks|uninstall-hooks|sync|show>
           ping
           version
           capabilities

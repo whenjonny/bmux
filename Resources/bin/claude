@@ -76,6 +76,58 @@ for arg in "$@"; do
     esac
 done
 
+lookup_resume_session_id() {
+    local workspace_id="${CMUX_WORKSPACE_ID:-}"
+    local surface_id="${CMUX_SURFACE_ID:-}"
+    local state_path="${CMUX_CLAUDE_HOOK_STATE_PATH:-$HOME/.cmuxterm/claude-hook-sessions.json}"
+    [[ -n "$workspace_id" && -f "$state_path" ]] || return 1
+
+    # Pick the freshest surface match first, then workspace match.
+    python3 - "$state_path" "$workspace_id" "$surface_id" <<'PY'
+import json
+import sys
+
+path, workspace_id, surface_id = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+except Exception:
+    raise SystemExit(1)
+
+sessions = payload.get("sessions", {})
+if not isinstance(sessions, dict):
+    raise SystemExit(1)
+
+records = list(sessions.values())
+if not records:
+    raise SystemExit(1)
+
+def updated_at(rec):
+    try:
+        return float(rec.get("updatedAt", 0))
+    except Exception:
+        return 0.0
+
+surface_matches = [
+    r for r in records
+    if surface_id and r.get("workspaceId") == workspace_id and r.get("surfaceId") == surface_id
+]
+workspace_matches = [r for r in records if r.get("workspaceId") == workspace_id]
+
+candidate = None
+if surface_matches:
+    candidate = max(surface_matches, key=updated_at)
+elif workspace_matches:
+    candidate = max(workspace_matches, key=updated_at)
+
+session_id = (candidate or {}).get("sessionId")
+if isinstance(session_id, str) and session_id.strip():
+    print(session_id.strip())
+else:
+    raise SystemExit(1)
+PY
+}
+
 # Export the wrapper's PID. Because we exec claude below, this PID becomes
 # the actual claude process PID, which hooks use for stale-session detection.
 export CMUX_CLAUDE_PID=$$
@@ -92,6 +144,9 @@ HOOKS_JSON='{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","
 if [[ "$SKIP_SESSION_ID" == true ]]; then
     exec "$REAL_CLAUDE" --settings "$HOOKS_JSON" "$@"
 else
+    if RESUME_SESSION_ID="$(lookup_resume_session_id 2>/dev/null)"; then
+        exec "$REAL_CLAUDE" --resume "$RESUME_SESSION_ID" --settings "$HOOKS_JSON" "$@"
+    fi
     SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
     exec "$REAL_CLAUDE" --session-id "$SESSION_ID" --settings "$HOOKS_JSON" "$@"
 fi

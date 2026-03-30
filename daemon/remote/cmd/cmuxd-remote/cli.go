@@ -280,7 +280,7 @@ func runRPC(socketPath string, args []string, jsonOutput bool, refreshAddr func(
 // runBrowserRelay handles "cmux browser <subcommand>" by mapping to browser.* v2 methods.
 func runBrowserRelay(socketPath string, args []string, jsonOutput bool, refreshAddr func() string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "cmux browser: requires a subcommand (open, navigate, back, forward, reload, get-url)")
+		fmt.Fprintln(os.Stderr, "cmux browser: requires a subcommand (open, navigate, back, forward, reload, get-url, network)")
 		return 2
 	}
 
@@ -319,6 +319,8 @@ func runBrowserRelay(socketPath string, args []string, jsonOutput bool, refreshA
 		method = "browser.url.get"
 		flagKeys = []string{"surface"}
 		useSurfaceEnv = true
+	case "network":
+		return runBrowserNetwork(socketPath, subArgs, jsonOutput, refreshAddr)
 	default:
 		fmt.Fprintf(os.Stderr, "cmux browser: unknown subcommand %q\n", sub)
 		return 2
@@ -346,6 +348,70 @@ func runBrowserRelay(socketPath string, args []string, jsonOutput bool, refreshA
 	}
 	if useSurfaceEnv {
 		applySurfaceEnvFallback(params)
+	}
+
+	resp, err := socketRoundTripV2(socketPath, method, params, refreshAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cmux: %v\n", err)
+		return 1
+	}
+	if jsonOutput {
+		fmt.Println(resp)
+	} else {
+		fmt.Println(defaultRelayOutput(resp))
+	}
+	return 0
+}
+
+// runBrowserNetwork handles "cmux browser network <list|clear> [--filter <url>] [--with-body] [--surface <id>]".
+func runBrowserNetwork(socketPath string, args []string, jsonOutput bool, refreshAddr func() string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "cmux browser network: requires a subcommand (list, clear)")
+		return 2
+	}
+
+	action := args[0]
+	rest := args[1:]
+
+	var method string
+	switch action {
+	case "list":
+		method = "browser.network.requests"
+	case "clear":
+		method = "browser.network.clear"
+	default:
+		fmt.Fprintf(os.Stderr, "cmux browser network: unknown subcommand %q (use list or clear)\n", action)
+		return 2
+	}
+
+	params := make(map[string]any)
+
+	// Parse flags manually to support boolean --with-body
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case "--filter":
+			if i+1 < len(rest) {
+				params["filter"] = rest[i+1]
+				i++
+			}
+		case "--with-body":
+			params["with_body"] = true
+		case "--surface":
+			if i+1 < len(rest) {
+				params["surface_id"] = rest[i+1]
+				i++
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "cmux browser network: unknown flag %q\n", rest[i])
+			return 2
+		}
+	}
+
+	// Fallback to env var for surface_id
+	if _, ok := params["surface_id"]; !ok {
+		if envSf := os.Getenv("CMUX_SURFACE_ID"); envSf != "" {
+			params["surface_id"] = envSf
+		}
 	}
 
 	resp, err := socketRoundTripV2(socketPath, method, params, refreshAddr)

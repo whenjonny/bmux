@@ -1785,6 +1785,157 @@ final class BrowserPanel: Panel, ObservableObject {
         } catch (_) {}
       });
 
+      // --- Network monitoring: patch fetch() and XMLHttpRequest ---
+      window.__cmuxNetworkLog = window.__cmuxNetworkLog || [];
+      const __pushNetwork = (entry) => {
+        try {
+          window.__cmuxNetworkLog.push(entry);
+          if (window.__cmuxNetworkLog.length > 512) {
+            window.__cmuxNetworkLog.splice(0, window.__cmuxNetworkLog.length - 512);
+          }
+        } catch (_) {}
+      };
+
+      // Patch fetch()
+      const __origFetch = window.fetch;
+      if (__origFetch) {
+        window.fetch = function(...args) {
+          const startMs = Date.now();
+          let reqUrl = '';
+          let reqMethod = 'GET';
+          let reqHeaders = {};
+          let reqBody = null;
+          try {
+            if (typeof args[0] === 'string') {
+              reqUrl = args[0];
+            } else if (args[0] instanceof Request) {
+              reqUrl = args[0].url;
+              reqMethod = args[0].method || 'GET';
+            } else if (args[0] && args[0].toString) {
+              reqUrl = args[0].toString();
+            }
+            if (args[1]) {
+              reqMethod = args[1].method || reqMethod;
+              if (args[1].headers) {
+                try {
+                  if (args[1].headers instanceof Headers) {
+                    args[1].headers.forEach((v, k) => { reqHeaders[k] = v; });
+                  } else {
+                    reqHeaders = Object.assign({}, args[1].headers);
+                  }
+                } catch (_) {}
+              }
+              if (args[1].body) {
+                try { reqBody = typeof args[1].body === 'string' ? args[1].body : null; } catch (_) {}
+              }
+            }
+          } catch (_) {}
+
+          return __origFetch.apply(window, args).then((resp) => {
+            const entry = {
+              type: 'fetch',
+              url: reqUrl,
+              method: reqMethod.toUpperCase(),
+              status: resp.status,
+              status_text: resp.statusText || '',
+              request_headers: reqHeaders,
+              response_headers: {},
+              request_body: reqBody,
+              response_body: null,
+              duration_ms: Date.now() - startMs,
+              timestamp_ms: startMs
+            };
+            try {
+              resp.headers.forEach((v, k) => { entry.response_headers[k] = v; });
+            } catch (_) {}
+            // Clone response to capture body without consuming the original
+            try {
+              const clone = resp.clone();
+              clone.text().then((bodyText) => {
+                entry.response_body = bodyText && bodyText.length <= 32768 ? bodyText : (bodyText ? bodyText.slice(0, 32768) + '...[truncated]' : null);
+                __pushNetwork(entry);
+              }).catch(() => { __pushNetwork(entry); });
+            } catch (_) {
+              __pushNetwork(entry);
+            }
+            return resp;
+          }).catch((err) => {
+            __pushNetwork({
+              type: 'fetch',
+              url: reqUrl,
+              method: reqMethod.toUpperCase(),
+              status: 0,
+              status_text: 'error',
+              request_headers: reqHeaders,
+              response_headers: {},
+              request_body: reqBody,
+              response_body: null,
+              error: err ? String(err.message || err) : 'unknown',
+              duration_ms: Date.now() - startMs,
+              timestamp_ms: startMs
+            });
+            throw err;
+          });
+        };
+      }
+
+      // Patch XMLHttpRequest
+      const __origXHROpen = XMLHttpRequest.prototype.open;
+      const __origXHRSend = XMLHttpRequest.prototype.send;
+      const __origXHRSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__cmux = { method: (method || 'GET').toUpperCase(), url: String(url || ''), headers: {}, startMs: 0, body: null };
+        return __origXHROpen.apply(this, [method, url, ...rest]);
+      };
+      XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+        if (this.__cmux) { this.__cmux.headers[name] = value; }
+        return __origXHRSetHeader.apply(this, [name, value]);
+      };
+      XMLHttpRequest.prototype.send = function(body) {
+        if (this.__cmux) {
+          this.__cmux.startMs = Date.now();
+          if (typeof body === 'string') this.__cmux.body = body;
+        }
+        const xhr = this;
+        const onDone = () => {
+          if (!xhr.__cmux) return;
+          const m = xhr.__cmux;
+          const respHeaders = {};
+          try {
+            const raw = xhr.getAllResponseHeaders() || '';
+            raw.split('\\r\\n').forEach((line) => {
+              const idx = line.indexOf(':');
+              if (idx > 0) respHeaders[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+            });
+          } catch (_) {}
+          let respBody = null;
+          try {
+            if (xhr.responseType === '' || xhr.responseType === 'text') {
+              const t = xhr.responseText || '';
+              respBody = t.length <= 32768 ? t : t.slice(0, 32768) + '...[truncated]';
+            }
+          } catch (_) {}
+          __pushNetwork({
+            type: 'xhr',
+            url: m.url,
+            method: m.method,
+            status: xhr.status || 0,
+            status_text: xhr.statusText || '',
+            request_headers: m.headers,
+            response_headers: respHeaders,
+            request_body: m.body,
+            response_body: respBody,
+            duration_ms: Date.now() - m.startMs,
+            timestamp_ms: m.startMs
+          });
+          xhr.__cmux = null;
+        };
+        xhr.addEventListener('load', onDone);
+        xhr.addEventListener('error', onDone);
+        xhr.addEventListener('abort', onDone);
+        return __origXHRSend.apply(this, [body]);
+      };
+
       return true;
     })()
     """

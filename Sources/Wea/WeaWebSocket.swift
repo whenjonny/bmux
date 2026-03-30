@@ -29,7 +29,9 @@ final class WeaWebSocket: NSObject {
     private var session: URLSession?
     private var pingTimer: Timer?
     private var reconnectTimer: Timer?
-    private let reconnectInterval: TimeInterval = 3.0
+    private let baseReconnectInterval: TimeInterval = 3.0
+    private let maxReconnectInterval: TimeInterval = 60.0
+    private var reconnectAttempt = 0
     private let pingInterval: TimeInterval = 30.0
     private var intentionalDisconnect = false
 
@@ -84,6 +86,7 @@ final class WeaWebSocket: NSObject {
 
     private func onConnected() {
         state = .connected
+        reconnectAttempt = 0
         startPingLoop()
         sendFetch()
     }
@@ -129,6 +132,11 @@ final class WeaWebSocket: NSObject {
         if let messages = json["messages"] as? [[String: Any]] {
             for msg in messages {
                 if let msgData = msg["data"] as? [String: Any] {
+                    // Log raw payload for debugging group routing / name resolution
+                    if let payloadData = try? JSONSerialization.data(withJSONObject: msgData, options: []),
+                       let payloadStr = String(data: payloadData, encoding: .utf8) {
+                        weaLog("[WS] Inbound payload: \(String(payloadStr.prefix(800)))")
+                    }
                     onMessage?(msgData)
                 }
             }
@@ -153,7 +161,10 @@ final class WeaWebSocket: NSObject {
         guard !intentionalDisconnect else { return }
         cleanup()
         state = .reconnecting
-        reconnectTimer = Timer.scheduledTimer(withTimeInterval: reconnectInterval, repeats: false) { [weak self] _ in
+        let delay = min(baseReconnectInterval * pow(2.0, Double(reconnectAttempt)), maxReconnectInterval)
+        reconnectAttempt += 1
+        weaLog("[WeaWebSocket] Scheduling reconnect in \(delay)s (attempt \(reconnectAttempt))")
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             guard let self, !self.intentionalDisconnect else { return }
             let config = WeaBotConfig.shared
             guard let secret = config.loadSecret(), !config.appId.isEmpty else { return }
@@ -203,9 +214,8 @@ extension WeaWebSocket: URLSessionWebSocketDelegate {
             weaLog("[WeaWebSocket] Connection failed: \(error.localizedDescription)")
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.onStateChange?(.disconnected)
-                // Report error to service
                 WeaBotService.shared.reportConnectionError(error.localizedDescription)
+                self.scheduleReconnect()
             }
         }
     }

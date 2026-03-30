@@ -41,6 +41,7 @@ struct WeaParsedMessage {
     let timestamp: Int64
     let chatType: ChatType
     let groupId: String?
+    let groupName: String?
     let topicId: String?
     let isMentionBot: Bool
 
@@ -180,6 +181,16 @@ enum WeaMessageParser {
         let chatType: WeaParsedMessage.ChatType =
             dest.type == .group || groupId != nil ? .groupChat : .directMessage
 
+        // --- Group name: try dest.groupName, top-level groupName, or msg.groupName
+        let groupName: String? = {
+            if let destRaw = payload["dest"] as? [String: Any],
+               let name = destRaw["groupName"] as? String, !name.isEmpty { return name }
+            if let name = payload["groupName"] as? String, !name.isEmpty { return name }
+            if let msg = payload["msg"] as? [String: Any],
+               let name = msg["groupName"] as? String, !name.isEmpty { return name }
+            return nil
+        }()
+
         // --- Mention detection
         let isMentionBot = detectMentionBot(payload, content: text, botId: botId)
 
@@ -194,6 +205,7 @@ enum WeaMessageParser {
             timestamp: timestamp,
             chatType: chatType,
             groupId: groupId,
+            groupName: groupName,
             topicId: topicId,
             isMentionBot: isMentionBot,
             rawPayload: payload

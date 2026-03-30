@@ -128,6 +128,8 @@ final class WeaBotService: ObservableObject {
             return
         }
 
+        logger.info("WEA inbound: type=\(message.chatType.rawValue) groupId=\(message.groupId ?? "nil") groupName=\(message.groupName ?? "nil") sender=\(message.senderWuid) mention=\(message.isMentionBot) text=\(message.text.prefix(40))")
+
         switch message.chatType {
         case .directMessage:
             routeDirectMessage(message)
@@ -149,12 +151,17 @@ final class WeaBotService: ObservableObject {
         guard !config.isBlacklisted(groupId) else { return }
         guard message.isMentionBot else { return }
 
-        if let name = message.senderName, !name.isEmpty {
+        // Prefer the group name from the payload, fall back to existing known name.
+        if let name = message.groupName, !name.isEmpty {
             config.knownGroups[groupId] = name
         }
 
         let sessionKey = "group:\(groupId)"
-        let displayName = config.knownGroups[groupId] ?? "Group"
+        let displayName = config.knownGroups[groupId]
+            ?? "Group \(String(groupId.prefix(6)))"
+        let bridgeCount = self.bridges.count
+        let hasExisting = self.bridges[sessionKey] != nil
+        logger.info("WEA group route: \(sessionKey) → '\(displayName)' (bridges=\(bridgeCount) existing=\(hasExisting))")
         routeToSession(sessionKey: sessionKey, groupId: groupId, displayName: displayName, message: message)
     }
 
@@ -262,7 +269,7 @@ final class WeaBotService: ObservableObject {
             storeClaudeSessionId(sessionId, forWorkspaceId: workspaceId)
             return
         }
-        for bridge in bridges.values where bridge.isWeaMessageActive {
+        for bridge in bridges.values where bridge.isWeaMessageActive || bridge.hasPendingStartup {
             bridge.startTranscriptWatch(path: transcriptPath, sessionId: sessionId)
             return
         }

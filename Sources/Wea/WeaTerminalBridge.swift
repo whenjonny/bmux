@@ -50,6 +50,9 @@ final class WeaTerminalBridge {
     /// Claude Code hooks check this to know if the current prompt is from WEA.
     var isWeaMessageActive: Bool { state == .processing || state == .waitingInput }
 
+    /// True when a message was queued before the REPL was ready (startup).
+    var hasPendingStartup: Bool { !replReady && !pendingMessages.isEmpty }
+
     /// Flag file used by hooks to detect WEA-originated prompts.
     nonisolated let weaActiveMarkerPath: String
 

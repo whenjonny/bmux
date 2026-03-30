@@ -5358,6 +5358,14 @@ struct ContentView: View {
         )
         contributions.append(
             CommandPaletteCommandContribution(
+                commandId: "palette.openMarkdownFile",
+                title: constant(String(localized: "command.openMarkdownFile.title", defaultValue: "Open Markdown File…")),
+                subtitle: constant(String(localized: "command.openMarkdownFile.subtitle", defaultValue: "Markdown")),
+                keywords: ["open", "markdown", "md", "preview", "viewer", "chromium", "editor", "file"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
                 commandId: "palette.newTerminalTab",
                 title: constant(String(localized: "command.newTerminalTab.title", defaultValue: "New Tab (Terminal)")),
                 subtitle: constant(String(localized: "command.newTerminalTab.subtitle", defaultValue: "Tab")),
@@ -6038,6 +6046,13 @@ struct ContentView: View {
                 panel.prompt = String(localized: "panel.openFolder.prompt", defaultValue: "Open")
                 if panel.runModal() == .OK, let url = panel.url {
                     tabManager.addWorkspace(workingDirectory: url.path)
+                }
+            }
+        }
+        registry.register(commandId: "palette.openMarkdownFile") {
+            DispatchQueue.main.async {
+                if !openMarkdownFileInViewer() {
+                    NSSound.beep()
                 }
             }
         }
@@ -7429,6 +7444,56 @@ struct ContentView: View {
             NSWorkspace.shared.open([directoryURL], withApplicationAt: applicationURL, configuration: configuration)
             return true
         }
+    }
+
+    private func openMarkdownFileInViewer() -> Bool {
+        guard let workspace = tabManager.selectedWorkspace else { return false }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if let markdownType = UTType(filenameExtension: "md") {
+            panel.allowedContentTypes = [markdownType]
+        }
+        panel.title = String(
+            localized: "panel.openMarkdown.title",
+            defaultValue: "Open Markdown File"
+        )
+        panel.prompt = String(
+            localized: "panel.openMarkdown.prompt",
+            defaultValue: "Open"
+        )
+        guard panel.runModal() == .OK, let fileURL = panel.url else {
+            // User cancelled picker; don't treat as an error.
+            return true
+        }
+
+        let filePath = fileURL.standardizedFileURL.path
+        guard !filePath.isEmpty else { return false }
+
+        let sourcePanelId: UUID? = {
+            if let focusedPanelId = workspace.focusedPanelId,
+               workspace.panels[focusedPanelId] != nil {
+                return focusedPanelId
+            }
+            if let orderedPanelId = workspace.sidebarOrderedPanelIds().first(where: { workspace.panels[$0] != nil }) {
+                return orderedPanelId
+            }
+            return nil
+        }()
+
+        guard let sourcePanelId,
+              workspace.newMarkdownSplit(
+                  from: sourcePanelId,
+                  orientation: .horizontal,
+                  insertFirst: false,
+                  filePath: filePath,
+                  focus: true
+              ) != nil else {
+            return false
+        }
+        return true
     }
 
     private func openFocusedDirectoryInInlineVSCode(_ directoryURL: URL) -> Bool {
@@ -11394,6 +11459,7 @@ private struct TabItemView: View, Equatable {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .layoutPriority(1)
+                    .safeHelp(tab.title.count > 20 ? tab.title : nil)
 
                 Spacer(minLength: 0)
 

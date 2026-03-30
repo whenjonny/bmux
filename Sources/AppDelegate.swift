@@ -2410,6 +2410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         // Auto-connect WEA bot if configured
         if !isRunningUnderXCTest {
+            maybeSyncAgentConfigsOnLaunch()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 let config = WeaBotConfig.shared
                 if config.autoConnect && config.isConfigured {
@@ -2497,6 +2498,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
         }
 #endif
+    }
+
+    private func maybeSyncAgentConfigsOnLaunch() {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
+        let syncVersion = "\(version)+\(build)"
+        let syncKey = "cmux.agentConfigSync.version"
+        if UserDefaults.standard.string(forKey: syncKey) == syncVersion {
+            return
+        }
+
+        guard let cmuxPath = Bundle.main.resourceURL?
+            .appendingPathComponent("bin/cmux", isDirectory: false).path else {
+            return
+        }
+        guard FileManager.default.isExecutableFile(atPath: cmuxPath) else {
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: cmuxPath)
+            process.arguments = ["codex", "sync", "--yes", "--quiet"]
+            var env = ProcessInfo.processInfo.environment
+            env["CMUX_CLI_SENTRY_DISABLED"] = "1"
+            process.environment = env
+            do {
+                try process.run()
+                process.waitUntilExit()
+                if process.terminationStatus == 0 {
+                    UserDefaults.standard.set(syncVersion, forKey: syncKey)
+                }
+            } catch {
+                // Best-effort startup sync; ignore failures.
+            }
+        }
     }
 
 #if DEBUG

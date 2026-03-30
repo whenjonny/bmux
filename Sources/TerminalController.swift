@@ -2441,6 +2441,8 @@ class TerminalController {
             return v2Result(id: id, self.v2BrowserNetworkUnroute(params: params))
         case "browser.network.requests":
             return v2Result(id: id, self.v2BrowserNetworkRequests(params: params))
+        case "browser.network.clear":
+            return v2Result(id: id, self.v2BrowserNetworkClear(params: params))
         case "browser.screencast.start":
             return v2Result(id: id, self.v2BrowserScreencastStart(params: params))
         case "browser.screencast.stop":
@@ -2680,6 +2682,7 @@ class TerminalController {
             "browser.network.route",
             "browser.network.unroute",
             "browser.network.requests",
+            "browser.network.clear",
             "browser.screencast.start",
             "browser.screencast.stop",
             "browser.input_mouse",
@@ -10500,14 +10503,57 @@ class TerminalController {
     }
 
     private func v2BrowserNetworkRequests(params: [String: Any]) -> V2CallResult {
-        if let surfaceId = v2UUID(params, "surface_id") {
-            let items = v2BrowserUnsupportedNetworkRequestsBySurface[surfaceId] ?? []
-            return .err(code: "not_supported", message: "browser.network.requests is not supported on WKWebView", data: [
-                "details": "Request interception logs are unavailable without CDP network hooks",
-                "recorded_requests": items
-            ])
+        return v2BrowserWithPanel(params: params) { _, ws, surfaceId, browserPanel in
+            v2BrowserEnsureTelemetryHooks(surfaceId: surfaceId, browserPanel: browserPanel)
+            let filter = v2String(params, "filter")
+            let withBody = v2Bool(params, "with_body") ?? false
+            let clear = v2Bool(params, "clear") ?? false
+            let filterLiteral = filter.map(v2JSONLiteral) ?? "null"
+            let withBodyLiteral = withBody ? "true" : "false"
+            let clearLiteral = clear ? "true" : "false"
+            let script = """
+            (() => {
+              let items = Array.isArray(window.__cmuxNetworkLog) ? window.__cmuxNetworkLog.slice() : [];
+              const filter = \(filterLiteral);
+              if (filter) {
+                items = items.filter(e => e.url && e.url.indexOf(filter) !== -1);
+              }
+              if (!\(withBodyLiteral)) {
+                items = items.map(e => {
+                  const c = Object.assign({}, e);
+                  delete c.request_body;
+                  delete c.response_body;
+                  return c;
+                });
+              }
+              if (\(clearLiteral)) {
+                window.__cmuxNetworkLog = [];
+              }
+              return { ok: true, items: items };
+            })()
+            """
+            switch v2RunJavaScript(browserPanel.webView, script: script, timeout: 5.0, contentWorld: .page) {
+            case .failure(let message):
+                return .err(code: "js_error", message: message, data: nil)
+            case .success(let value):
+                let dict = value as? [String: Any]
+                let items = (dict?["items"] as? [Any]) ?? []
+                return .ok([
+                    "workspace_id": ws.id.uuidString,
+                    "workspace_ref": v2Ref(kind: .workspace, uuid: ws.id),
+                    "surface_id": surfaceId.uuidString,
+                    "surface_ref": v2Ref(kind: .surface, uuid: surfaceId),
+                    "entries": items.map(v2NormalizeJSValue),
+                    "count": items.count
+                ])
+            }
         }
-        return v2BrowserNotSupported("browser.network.requests", details: "Request interception logs are unavailable without CDP network hooks")
+    }
+
+    private func v2BrowserNetworkClear(params: [String: Any]) -> V2CallResult {
+        var withClear = params
+        withClear["clear"] = true
+        return v2BrowserNetworkRequests(params: withClear)
     }
 
     private func v2BrowserScreencastStart(params _: [String: Any]) -> V2CallResult {
