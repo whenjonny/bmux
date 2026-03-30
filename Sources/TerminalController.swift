@@ -1985,6 +1985,8 @@ class TerminalController {
                 return weaSessionStart(args)
             case "wea_ask_question":
                 return weaAskQuestion(args)
+            case "wea_send_file":
+                return weaSendFile(args)
 
             default:
                 return "ERROR: Unknown command '\(cmd)'. Use 'help' for available commands."
@@ -2035,10 +2037,12 @@ class TerminalController {
         }
         let workspaceId = json["workspace_id"] as? String ?? ""
         let transcriptPath = json["transcript_path"] as? String
+        let sessionId = json["session_id"] as? String
         DispatchQueue.main.async {
             WeaBotService.shared.handleSessionStart(
                 workspaceId: workspaceId,
-                transcriptPath: transcriptPath
+                transcriptPath: transcriptPath,
+                sessionId: sessionId
             )
         }
         return "OK"
@@ -2056,6 +2060,35 @@ class TerminalController {
                 workspaceId: workspaceId,
                 questionText: questionText
             )
+        }
+        return "OK"
+    }
+
+    private func weaSendFile(_ args: String) -> String {
+        guard let data = args.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "ERROR: Invalid JSON"
+        }
+        let workspaceId = json["workspace_id"] as? String ?? ""
+        let filePath = json["file_path"] as? String ?? ""
+        let body = json["body"] as? String ?? ""
+
+        guard !workspaceId.isEmpty else { return "ERROR: Missing workspace_id" }
+        guard !filePath.isEmpty else { return "ERROR: Missing file_path" }
+        guard FileManager.default.fileExists(atPath: filePath) else {
+            return "ERROR: File not found: \(filePath)"
+        }
+
+        // Fire-and-forget: upload runs async on main actor (same pattern as other wea_* commands).
+        // The CLI returns immediately; upload progress is in /tmp/cmux-wea-debug.log.
+        DispatchQueue.main.async {
+            Task {
+                await WeaBotService.shared.handleSendFile(
+                    workspaceId: workspaceId,
+                    filePath: filePath,
+                    body: body
+                )
+            }
         }
         return "OK"
     }

@@ -4548,10 +4548,13 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         metalLayer.pixelFormat = .bgra8Unorm
         metalLayer.isOpaque = false
         // framebufferOnly=false lets the macOS compositor read the drawable
-        // when blending translucent or blurred window layers.  This matches
-        // standalone Ghostty's SurfaceView and is required for background-opacity
-        // and background-blur to render correctly.
-        metalLayer.framebufferOnly = false
+        // when blending translucent or blurred window layers.  Required for
+        // background-opacity and background-blur.  When the window is fully
+        // opaque we keep framebufferOnly=true so the GPU can use faster
+        // private-memory drawables.
+        let needsCompositorAccess = GhosttyApp.shared.defaultBackgroundOpacity < 0.999
+            || cmuxShouldUseTransparentBackgroundWindow()
+        metalLayer.framebufferOnly = !needsCompositorAccess
         return metalLayer
     }
 
@@ -4580,6 +4583,12 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             // avoids stacking multiple identical translucent backgrounds (which looks opaque).
             layer.backgroundColor = NSColor.clear.cgColor
             layer.isOpaque = false
+            // Update framebufferOnly when opacity changes at runtime.
+            if let metalLayer = layer as? CAMetalLayer {
+                let needsCompositorAccess = GhosttyApp.shared.defaultBackgroundOpacity < 0.999
+                    || cmuxShouldUseTransparentBackgroundWindow()
+                metalLayer.framebufferOnly = !needsCompositorAccess
+            }
             CATransaction.commit()
         }
         terminalSurface?.hostedView.setBackgroundColor(color)
@@ -5948,7 +5957,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
 
         // Use accumulated text from insertText (for IME), or compute text for key
         let accumulatedText = keyTextAccumulator ?? []
-        var shouldRefreshAfterTextInput = false
+        // (forceRefresh after text input removed — Ghostty vsync handles redraw)
         if !accumulatedText.isEmpty {
             // Accumulated text comes from insertText (IME composition result).
             // These never have "composing" set to true because these are the
@@ -5956,7 +5965,6 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             keyEvent.composing = false
             for text in accumulatedText {
                 if shouldSendText(text) {
-                    shouldRefreshAfterTextInput = true
 #if DEBUG
                     let sendTimingStart = CmuxTypingTiming.start()
                     let ghosttySendStart = ProcessInfo.processInfo.systemUptime
@@ -6022,7 +6030,6 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
                 )
             if let text = textForKeyEvent(translationEvent) {
                 if shouldSendText(text), !suppressShiftSpaceFallbackText {
-                    shouldRefreshAfterTextInput = true
 #if DEBUG
                     let sendTimingStart = CmuxTypingTiming.start()
                     let ghosttySendStart = ProcessInfo.processInfo.systemUptime
@@ -6074,17 +6081,11 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             }
         }
 
-        if shouldRefreshAfterTextInput {
-#if DEBUG
-            let refreshStart = ProcessInfo.processInfo.systemUptime
-#endif
-            terminalSurface?.forceRefresh(reason: "keyDown.textInput")
-#if DEBUG
-            refreshMs = (ProcessInfo.processInfo.systemUptime - refreshStart) * 1000.0
-#endif
-        }
-
         // Rendering is driven by Ghostty's wakeups/renderer.
+        // Ghostty's vsync display link redraws after ghostty_surface_key/text,
+        // so an explicit forceRefresh here is redundant and adds per-keystroke
+        // overhead (display-ID reassertion, surface-size recalculation, and a
+        // forced Metal redraw).
     }
 
     @discardableResult

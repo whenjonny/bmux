@@ -10,6 +10,8 @@ final class WeaSessionRegistry {
         let sessionKey: String
         let groupId: String
         let displayName: String
+        var workspaceId: String
+        var panelId: String
         var alive: Bool
         var lastMessageAt: Date
     }
@@ -29,11 +31,13 @@ final class WeaSessionRegistry {
 
     // MARK: - Public API
 
-    func register(sessionKey: String, groupId: String, displayName: String) {
+    func register(sessionKey: String, groupId: String, displayName: String, workspaceId: UUID, panelId: UUID) {
         entries[sessionKey] = Entry(
             sessionKey: sessionKey,
             groupId: groupId,
             displayName: displayName,
+            workspaceId: workspaceId.uuidString,
+            panelId: panelId.uuidString,
             alive: true,
             lastMessageAt: Date()
         )
@@ -58,6 +62,10 @@ final class WeaSessionRegistry {
         entry.lastMessageAt = Date()
         entries[sessionKey] = entry
         save()
+    }
+
+    func entry(for sessionKey: String) -> Entry? {
+        entries[sessionKey]
     }
 
     func removeAll() {

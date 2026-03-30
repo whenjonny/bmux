@@ -1044,7 +1044,6 @@ struct TitlebarControlsView: View {
     @State private var shortcutRefreshTick = 0
     @State private var isHoveringControls = false
     @State private var isNotificationsPopoverShown = false
-    @State private var isCronJobsPopoverShown = false
     @StateObject private var modifierKeyMonitor = TitlebarShortcutHintModifierMonitor()
     private let titlebarHintRightSafetyShift: CGFloat = 10
     private let titlebarHintBaseXShift: CGFloat = -10
@@ -1083,7 +1082,7 @@ struct TitlebarControlsView: View {
         if visibilityMode == .alwaysVisible {
             return true
         }
-        return isHoveringControls || isNotificationsPopoverShown || isCronJobsPopoverShown || shouldShowTitlebarShortcutHints
+        return isHoveringControls || isNotificationsPopoverShown || shouldShowTitlebarShortcutHints
     }
 
     var body: some View {
@@ -1176,18 +1175,6 @@ struct TitlebarControlsView: View {
             .background(NotificationsAnchorView { viewModel.notificationsAnchorView = $0 })
             .accessibilityLabel(String(localized: "titlebar.notifications.accessibilityLabel", defaultValue: "Notifications"))
             .safeHelp(KeyboardShortcutSettings.Action.showNotifications.tooltip(String(localized: "titlebar.notifications.tooltip", defaultValue: "Show notifications")))
-
-            TitlebarControlButton(config: config, action: {
-                isCronJobsPopoverShown.toggle()
-            }) {
-                iconLabel(systemName: "clock", config: config)
-            }
-            .accessibilityIdentifier("titlebarControl.showCronJobs")
-            .accessibilityLabel(String(localized: "titlebar.cron.accessibilityLabel", defaultValue: "Cron Jobs"))
-            .safeHelp(String(localized: "titlebar.cron.tooltip", defaultValue: "Edit cron jobs"))
-            .popover(isPresented: $isCronJobsPopoverShown, arrowEdge: .bottom) {
-                CronJobsPopoverView()
-            }
 
             TitlebarControlButton(config: config, action: {
                 #if DEBUG
@@ -1337,6 +1324,197 @@ struct TitlebarControlsView: View {
         } else {
             icon
         }
+    }
+}
+
+// MARK: - Right-side titlebar controls (Cron Jobs + Launch Claude)
+
+struct TitlebarRightControlsView: View {
+    @AppStorage("titlebarControlsStyle") private var styleRawValue = TitlebarControlsStyle.classic.rawValue
+    @State private var isCronJobsPopoverShown = false
+
+    var body: some View {
+        let style = TitlebarControlsStyle(rawValue: styleRawValue) ?? .classic
+        let config = style.config
+        HStack(spacing: config.spacing) {
+            TitlebarControlButton(config: config, action: {
+                isCronJobsPopoverShown.toggle()
+            }) {
+                titlebarRightIconLabel(systemName: "clock", config: config)
+            }
+            .accessibilityIdentifier("titlebarControl.showCronJobs")
+            .accessibilityLabel(String(localized: "titlebar.cron.accessibilityLabel", defaultValue: "Cron Jobs"))
+            .safeHelp(String(localized: "titlebar.cron.tooltip", defaultValue: "Edit cron jobs"))
+            .popover(isPresented: $isCronJobsPopoverShown, arrowEdge: .bottom) {
+                CronJobsPopoverView()
+            }
+
+            TitlebarControlButton(config: config, action: {
+                if let tabManager = AppDelegate.shared?.tabManager,
+                   let workspace = tabManager.selectedWorkspace {
+                    if let panel = workspace.newTerminalSurfaceInFocusedPane(focus: true) {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            panel.sendInput("codemax claude --allow-dangerously-skip-permissions --model=bedrock-claude-4-6-opus\n")
+                        }
+                    }
+                }
+            }) {
+                titlebarRightIconLabel(systemName: "brain", config: config)
+            }
+            .accessibilityIdentifier("titlebarControl.launchClaude")
+            .accessibilityLabel(String(localized: "titlebar.launchClaude.accessibilityLabel", defaultValue: "Launch Claude"))
+            .safeHelp(String(localized: "titlebar.launchClaude.tooltip", defaultValue: "Launch Claude in current tab"))
+        }
+        .padding(.trailing, 8)
+    }
+
+    @ViewBuilder
+    private func titlebarRightIconLabel(systemName: String, config: TitlebarControlsStyleConfig) -> some View {
+        let icon = Image(systemName: systemName)
+            .font(.system(size: config.iconSize, weight: .semibold))
+            .frame(width: config.buttonSize, height: config.buttonSize)
+
+        if config.buttonBackground {
+            icon
+                .background(
+                    RoundedRectangle(cornerRadius: config.buttonCornerRadius)
+                        .fill(Color(nsColor: .controlBackgroundColor).opacity(0.7))
+                )
+        } else {
+            icon
+        }
+    }
+}
+
+final class TitlebarRightControlsAccessoryViewController: NSTitlebarAccessoryViewController {
+    private let hostingView: NonDraggableHostingView<TitlebarRightControlsView>
+    private let containerView = NSView()
+    private var pendingSizeUpdate = false
+    private var fittingSizeNeedsRefresh = true
+    private var cachedFittingSize: NSSize?
+    private var lastObservedViewSize: NSSize = .zero
+    private var lastAppliedLayoutSnapshot: TitlebarControlsLayoutSnapshot?
+    private var userDefaultsObserver: NSObjectProtocol?
+    private var showsWorkspaceTitlebar: Bool { !WorkspacePresentationModeSettings.isMinimal() }
+
+    init() {
+        hostingView = NonDraggableHostingView(rootView: TitlebarRightControlsView())
+        super.init(nibName: nil, bundle: nil)
+
+        view = containerView
+        containerView.translatesAutoresizingMaskIntoConstraints = true
+        containerView.wantsLayer = true
+        containerView.layer?.masksToBounds = false
+        hostingView.translatesAutoresizingMaskIntoConstraints = true
+        hostingView.autoresizingMask = [.width, .height]
+        containerView.addSubview(hostingView)
+
+        userDefaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyWorkspaceTitlebarVisibility()
+            if self?.showsWorkspaceTitlebar == true {
+                self?.restoreSizeAfterMinimalMode()
+            }
+        }
+
+        applyWorkspaceTitlebarVisibility()
+        scheduleSizeUpdate(invalidateFittingSize: true)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        if let userDefaultsObserver {
+            NotificationCenter.default.removeObserver(userDefaultsObserver)
+        }
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        scheduleSizeUpdate(invalidateFittingSize: true)
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        let currentViewSize = view.bounds.size
+        guard titlebarControlsShouldScheduleForViewSizeChange(
+            previous: lastObservedViewSize,
+            current: currentViewSize
+        ) else { return }
+        lastObservedViewSize = currentViewSize
+        scheduleSizeUpdate(invalidateFittingSize: true)
+    }
+
+    private func scheduleSizeUpdate(invalidateFittingSize: Bool = false) {
+        if invalidateFittingSize { fittingSizeNeedsRefresh = true }
+        guard !pendingSizeUpdate else { return }
+        pendingSizeUpdate = true
+        DispatchQueue.main.async { [weak self] in
+            self?.pendingSizeUpdate = false
+            self?.updateSize()
+        }
+    }
+
+    private func updateSize() {
+        applyWorkspaceTitlebarVisibility()
+        guard showsWorkspaceTitlebar else { return }
+        let contentSize: NSSize
+        if fittingSizeNeedsRefresh || cachedFittingSize == nil {
+            hostingView.invalidateIntrinsicContentSize()
+            hostingView.layoutSubtreeIfNeeded()
+            cachedFittingSize = hostingView.fittingSize
+            fittingSizeNeedsRefresh = false
+        }
+        contentSize = cachedFittingSize ?? .zero
+        guard contentSize.width > 0, contentSize.height > 0 else { return }
+
+        let titlebarHeight: CGFloat = {
+            if let window = view.window,
+               let closeButton = window.standardWindowButton(.closeButton),
+               let titlebarView = closeButton.superview,
+               titlebarView.frame.height > 0 {
+                return titlebarView.frame.height
+            }
+            return view.window.map { $0.frame.height - $0.contentLayoutRect.height } ?? contentSize.height
+        }()
+        let containerHeight = max(contentSize.height, titlebarHeight)
+        let yOffset = max(0, (containerHeight - contentSize.height) / 2.0)
+        let nextLayoutSnapshot = TitlebarControlsLayoutSnapshot(
+            contentSize: contentSize,
+            containerHeight: containerHeight,
+            yOffset: yOffset
+        )
+        guard titlebarControlsShouldApplyLayout(
+            previous: lastAppliedLayoutSnapshot,
+            next: nextLayoutSnapshot
+        ) else { return }
+        lastAppliedLayoutSnapshot = nextLayoutSnapshot
+        preferredContentSize = NSSize(width: contentSize.width, height: containerHeight)
+        containerView.frame = NSRect(x: 0, y: 0, width: contentSize.width, height: containerHeight)
+        hostingView.frame = NSRect(x: 0, y: yOffset, width: contentSize.width, height: contentSize.height)
+    }
+
+    private func applyWorkspaceTitlebarVisibility() {
+        let shouldShow = showsWorkspaceTitlebar
+        self.isHidden = !shouldShow
+        view.isHidden = !shouldShow
+        view.alphaValue = shouldShow ? 1 : 0
+        if !shouldShow { preferredContentSize = .zero }
+    }
+
+    private func restoreSizeAfterMinimalMode() {
+        guard showsWorkspaceTitlebar else { return }
+        let seed = cachedFittingSize ?? NSSize(width: 100, height: 28)
+        if hostingView.frame.size == .zero || containerView.frame.size == .zero {
+            containerView.frame.size = seed
+            hostingView.frame.size = seed
+        }
+        scheduleSizeUpdate(invalidateFittingSize: true)
     }
 }
 
@@ -2009,7 +2187,9 @@ final class UpdateTitlebarAccessoryController {
     private var pendingAttachRetries: [ObjectIdentifier: Int] = [:]
     private var startupScanWorkItems: [DispatchWorkItem] = []
     private let controlsIdentifier = NSUserInterfaceItemIdentifier("cmux.titlebarControls")
+    private let rightControlsIdentifier = NSUserInterfaceItemIdentifier("cmux.titlebarRightControls")
     private let controlsControllers = NSHashTable<TitlebarControlsAccessoryViewController>.weakObjects()
+    private let rightControlsControllers = NSHashTable<TitlebarRightControlsAccessoryViewController>.weakObjects()
     private var lastKnownPresentationMode: WorkspacePresentationModeSettings.Mode = WorkspacePresentationModeSettings.mode()
 
     init(viewModel: UpdateViewModel) {
@@ -2086,10 +2266,10 @@ final class UpdateTitlebarAccessoryController {
         // When switching back to standard mode while a window is in fullscreen,
         // hide the accessories because fullscreen uses SwiftUI overlay controls.
         if currentMode == .standard {
-            let controlsId = self.controlsIdentifier
+            let ids: Set<NSUserInterfaceItemIdentifier> = [controlsIdentifier, rightControlsIdentifier]
             for window in NSApp.windows where window.styleMask.contains(.fullScreen) {
                 for accessory in window.titlebarAccessoryViewControllers
-                    where accessory.view.identifier == controlsId {
+                    where accessory.view.identifier.map({ ids.contains($0) }) == true {
                     accessory.isHidden = true
                     accessory.view.alphaValue = 0
                 }
@@ -2168,6 +2348,14 @@ final class UpdateTitlebarAccessoryController {
             controlsControllers.add(controls)
         }
 
+        if !window.titlebarAccessoryViewControllers.contains(where: { $0.view.identifier == rightControlsIdentifier }) {
+            let rightControls = TitlebarRightControlsAccessoryViewController()
+            rightControls.layoutAttribute = .right
+            rightControls.view.identifier = rightControlsIdentifier
+            window.addTitlebarAccessoryViewController(rightControls)
+            rightControlsControllers.add(rightControls)
+        }
+
         attachedWindows.add(window)
 
 #if DEBUG
@@ -2180,8 +2368,10 @@ final class UpdateTitlebarAccessoryController {
     }
 
     private func removeAccessoryIfPresent(from window: NSWindow) {
+        let identifiers: Set<NSUserInterfaceItemIdentifier> = [controlsIdentifier, rightControlsIdentifier]
         let matchingIndices = window.titlebarAccessoryViewControllers.indices.reversed().filter { index in
-            window.titlebarAccessoryViewControllers[index].view.identifier == controlsIdentifier
+            guard let id = window.titlebarAccessoryViewControllers[index].view.identifier else { return false }
+            return identifiers.contains(id)
         }
         guard !matchingIndices.isEmpty || attachedWindows.contains(window) else { return }
 

@@ -138,6 +138,8 @@
 		WEA00001A1B2C3D4E5F60008 /* WeaBotConfigSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60080 /* WeaBotConfigSheet.swift */; };
 		WEA00001A1B2C3D4E5F60009 /* WeaWorkspaceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F60090 /* WeaWorkspaceManager.swift */; };
 		WEA00001A1B2C3D4E5F6000A /* WeaSessionRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F600A0 /* WeaSessionRegistry.swift */; };
+		WEA00001A1B2C3D4E5F6000B /* WeaFileCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F600B0 /* WeaFileCrypto.swift */; };
+		WEA00001A1B2C3D4E5F6000C /* WeaFileUploader.swift in Sources */ = {isa = PBXBuildFile; fileRef = WEA00001A1B2C3D4E5F600C0 /* WeaFileUploader.swift */; };
 	/* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -322,6 +324,8 @@
 		WEA00001A1B2C3D4E5F60080 /* WeaBotConfigSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaBotConfigSheet.swift; sourceTree = "<group>"; };
 		WEA00001A1B2C3D4E5F60090 /* WeaWorkspaceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaWorkspaceManager.swift; sourceTree = "<group>"; };
 		WEA00001A1B2C3D4E5F600A0 /* WeaSessionRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaSessionRegistry.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F600B0 /* WeaFileCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaFileCrypto.swift; sourceTree = "<group>"; };
+		WEA00001A1B2C3D4E5F600C0 /* WeaFileUploader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wea/WeaFileUploader.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -501,6 +505,8 @@
 				WEA00001A1B2C3D4E5F60080 /* WeaBotConfigSheet.swift */,
 				WEA00001A1B2C3D4E5F60090 /* WeaWorkspaceManager.swift */,
 				WEA00001A1B2C3D4E5F600A0 /* WeaSessionRegistry.swift */,
+				WEA00001A1B2C3D4E5F600B0 /* WeaFileCrypto.swift */,
+				WEA00001A1B2C3D4E5F600C0 /* WeaFileUploader.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -753,6 +759,8 @@
 					WEA00001A1B2C3D4E5F60008 /* WeaBotConfigSheet.swift in Sources */,
 					WEA00001A1B2C3D4E5F60009 /* WeaWorkspaceManager.swift in Sources */,
 					WEA00001A1B2C3D4E5F6000A /* WeaSessionRegistry.swift in Sources */,
+					WEA00001A1B2C3D4E5F6000B /* WeaFileCrypto.swift in Sources */,
+					WEA00001A1B2C3D4E5F6000C /* WeaFileUploader.swift in Sources */,
 					A5001002 /* ContentView.swift in Sources */,
 					E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */,
 					B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */,

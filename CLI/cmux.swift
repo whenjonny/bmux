@@ -456,6 +456,10 @@ private final class ClaudeHookSessionStore {
     }
 
     private func withLockedState<T>(_ body: (inout ClaudeHookSessionStoreFile) throws -> T) throws -> T {
+        // Ensure parent directory exists before creating the lock file.
+        let parentURL = URL(fileURLWithPath: statePath).deletingLastPathComponent()
+        try fileManager.createDirectory(at: parentURL, withIntermediateDirectories: true, attributes: nil)
+
         let lockPath = statePath + ".lock"
         let fd = open(lockPath, O_CREAT | O_RDWR, mode_t(S_IRUSR | S_IWUSR))
         if fd < 0 {
@@ -2290,6 +2294,9 @@ struct CMUXCLI {
                 cliTelemetry.captureError(stage: "codex_hook_dispatch", error: error)
                 throw error
             }
+
+        case "wea":
+            try runWeaCommand(commandArgs: commandArgs, client: client)
 
         case "set-app-focus":
             guard let value = commandArgs.first else { throw CLIError(message: "set-app-focus requires a value") }
@@ -11059,6 +11066,43 @@ struct CMUXCLI {
         }
     }
 
+    // MARK: - WEA Commands
+
+    private func runWeaCommand(commandArgs: [String], client: SocketClient) throws {
+        let subcommand = commandArgs.first?.lowercased() ?? "help"
+        let subArgs = Array(commandArgs.dropFirst())
+
+        switch subcommand {
+        case "send-file":
+            guard let fileArg = subArgs.first, !fileArg.hasPrefix("-") else {
+                throw CLIError(message: "Usage: cmux wea send-file <path> [--body \"caption\"]")
+            }
+            let filePath = resolvePath(fileArg)
+            guard FileManager.default.fileExists(atPath: filePath) else {
+                throw CLIError(message: "File not found: \(filePath)")
+            }
+            let workspaceId = ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] ?? ""
+            guard !workspaceId.isEmpty else {
+                throw CLIError(message: "CMUX_WORKSPACE_ID not set. Run this command inside a cmux terminal.")
+            }
+            let body = optionValue(subArgs, name: "--body") ?? ""
+            var payload: [String: Any] = [
+                "workspace_id": workspaceId,
+                "file_path": filePath,
+            ]
+            if !body.isEmpty { payload["body"] = body }
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+                  let jsonStr = String(data: jsonData, encoding: .utf8) else {
+                throw CLIError(message: "Failed to serialize payload")
+            }
+            let response = try sendV1Command("wea_send_file \(jsonStr)", client: client)
+            print(response)
+
+        default:
+            throw CLIError(message: "Unknown wea subcommand: \(subcommand). Available: send-file")
+        }
+    }
+
     private func runClaudeHook(
         commandArgs: [String],
         client: SocketClient,
@@ -11223,17 +11267,33 @@ struct CMUXCLI {
         case "notification", "notify":
             telemetry.breadcrumb("claude-hook.notification")
             var summary = summarizeClaudeHookNotification(rawInput: rawInput)
+            let isWeaSession = hasWeaActiveMarker()
 
+            cliWeaLog("[CLI:notification] sessionId=\(parsedInput.sessionId ?? "nil") summary.body=\(summary.body.prefix(100))")
             let mappedSession = parsedInput.sessionId.flatMap { try? sessionStore.lookup(sessionId: $0) }
             let workspaceId = try resolvePreferredWorkspaceIdForClaudeHook(
                 preferred: mappedSession?.workspaceId,
                 fallback: workspaceArg,
                 client: client
             )
+            cliWeaLog("[CLI:notification] mappedSession=\(mappedSession != nil) lastBody=\(mappedSession?.lastBody?.prefix(100) ?? "nil")")
             if let mappedSession,
                let savedBody = mappedSession.lastBody, !savedBody.isEmpty,
-               summary.body.contains("needs your attention") || summary.body.contains("needs your input") {
+               summary.body.contains("needs your attention") || summary.body.contains("needs your input") || summary.body.contains("needs your permission") {
+                cliWeaLog("[CLI:notification] ENRICHED with savedBody (\(savedBody.count) chars)")
                 summary = (subtitle: mappedSession.lastSubtitle ?? summary.subtitle, body: savedBody)
+            } else {
+                cliWeaLog("[CLI:notification] NOT enriched: matchSession=\(mappedSession != nil) bodyMatch=\(summary.body.contains("needs your attention") || summary.body.contains("needs your input") || summary.body.contains("needs your permission"))")
+            }
+
+            // WEA fast path: send notification immediately after enrichment,
+            // before the slower surface resolution and status updates.
+            if isWeaSession {
+                cliWeaLog("[CLI:notification] WEA fast send: ws=\(workspaceId) question=\(summary.body.prefix(100))")
+                sendWeaHookCommand("wea_claude_notification", payload: [
+                    "workspace_id": workspaceId,
+                    "question": summary.body
+                ], client: client)
             }
 
             let surfaceId = try resolvePreferredSurfaceIdForClaudeHook(
@@ -11257,14 +11317,6 @@ struct CMUXCLI {
                     lastSubtitle: summary.subtitle,
                     lastBody: summary.body
                 )
-            }
-
-            // Forward notification to WEA if this is a WEA-originated session
-            if hasWeaActiveMarker() {
-                sendWeaHookCommand("wea_claude_notification", payload: [
-                    "workspace_id": workspaceId,
-                    "question": summary.body
-                ], client: client)
             }
 
             let response = try client.send(command: "notify_target \(workspaceId) \(surfaceId) \(payload)")
@@ -11352,6 +11404,26 @@ struct CMUXCLI {
                 // The Notification hook fires right after and will use the saved question.
                 print("OK")
                 return
+            }
+
+            // Save tool details for non-AskUserQuestion tools so the Notification
+            // handler can build a rich permission prompt for WEA.
+            if let toolName = parsedInput.object?["tool_name"] as? String,
+               let sessionId = parsedInput.sessionId {
+                let existingSurfaceId = (try? sessionStore.lookup(sessionId: sessionId))?.surfaceId ?? ""
+                let toolInput = parsedInput.object?["tool_input"]
+                let objectKeys = parsedInput.object?.keys.sorted().joined(separator: ",") ?? "nil"
+                cliWeaLog("[CLI:pre-tool-use] objectKeys=[\(objectKeys)] tool_input_type=\(toolInput.map { "\(type(of: $0))" } ?? "nil")")
+                let toolDescription = describeToolUseForPermission(parsedInput.object)
+                cliWeaLog("[CLI:pre-tool-use] tool=\(toolName) sessionId=\(sessionId) desc=\(toolDescription.prefix(200))")
+                try? sessionStore.upsert(
+                    sessionId: sessionId,
+                    workspaceId: workspaceId,
+                    surfaceId: existingSurfaceId,
+                    cwd: parsedInput.cwd,
+                    lastSubtitle: toolName,
+                    lastBody: toolDescription
+                )
             }
 
             _ = try? sendV1Command("clear_notifications --tab=\(workspaceId)", client: client)
@@ -11553,6 +11625,51 @@ struct CMUXCLI {
         default:
             return toolName
         }
+    }
+
+    /// Build a rich permission prompt description including tool name, command,
+    /// and numbered options for WEA forwarding.
+    private func describeToolUseForPermission(_ object: [String: Any]?) -> String {
+        guard let object, let toolName = object["tool_name"] as? String else {
+            return "Claude needs your permission"
+        }
+        let input = object["tool_input"] as? [String: Any]
+
+        var parts: [String] = []
+        parts.append("**\(toolName)**")
+
+        switch toolName {
+        case "Bash":
+            if let cmd = input?["command"] as? String {
+                parts.append("`\(String(cmd.prefix(500)))`")
+            }
+            if let desc = input?["description"] as? String, !desc.isEmpty {
+                parts.append(desc)
+            }
+        case "Edit", "Write":
+            if let path = input?["file_path"] as? String {
+                parts.append("`\(path)`")
+            }
+        case "Read":
+            if let path = input?["file_path"] as? String {
+                parts.append("`\(path)`")
+            }
+        case "WebFetch":
+            if let url = input?["url"] as? String {
+                parts.append(url)
+            }
+        default:
+            if let desc = input?["description"] as? String, !desc.isEmpty {
+                parts.append(desc)
+            }
+        }
+
+        parts.append("")
+        parts.append("1. Yes")
+        parts.append("2. Yes, and don't ask again for this project")
+        parts.append("3. No")
+
+        return parts.joined(separator: "\n")
     }
 
     private func shortenPath(_ path: String) -> String {
@@ -11922,6 +12039,18 @@ struct CMUXCLI {
     }
 
     /// Check if any WEA session is active (marker file exists in tmp dir).
+    private func cliWeaLog(_ message: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        let path = "/tmp/cmux-wea-debug.log"
+        if let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+        }
+    }
+
     private func hasWeaActiveMarker() -> Bool {
         let tmpDir = NSTemporaryDirectory()
         let contents = (try? FileManager.default.contentsOfDirectory(atPath: tmpDir)) ?? []

@@ -30,17 +30,21 @@ final class WeaTerminalBridge {
     private let panel: TerminalPanel
     let panelId: UUID
     private let httpClient: WeaHttpClient
-    private let dest: WeaMessageDest
-    private let launcherCommands: [String]
+    let dest: WeaMessageDest
 
     private(set) var state: State = .idle
     private(set) var processAlive: Bool = true
+    private(set) var claudeSessionId: String?
     private var activeCardId: String?
+    /// Queue of thinking card IDs — one per injected message, replied in FIFO order.
+    private var thinkingCardIds: [String] = []
+    /// Number of messages injected that haven't received a Stop reply yet.
+    private var pendingReplyCount = 0
     private var pendingMessages: [String] = []
     private var replReady = false
     private var startupTimeoutTask: Task<Void, Never>?
-    private var startupRetryCount = 0
-    private let startupTimeoutSeconds: UInt64 = 25
+    private let startupTimeoutSeconds: UInt64 = 30
+
 
     /// Set by WeaBotService when a WEA message is being injected.
     /// Claude Code hooks check this to know if the current prompt is from WEA.
@@ -53,19 +57,17 @@ final class WeaTerminalBridge {
         sessionKey: String,
         panel: TerminalPanel,
         httpClient: WeaHttpClient,
-        dest: WeaMessageDest,
-        launcherCommands: [String]
+        dest: WeaMessageDest
     ) {
         self.sessionKey = sessionKey
         self.panel = panel
         self.panelId = panel.id
         self.httpClient = httpClient
         self.dest = dest
-        self.launcherCommands = launcherCommands
         let safe = sessionKey.replacingOccurrences(of: ":", with: "_")
         self.weaActiveMarkerPath = "\(NSTemporaryDirectory())cmux-wea-active-\(safe)"
 
-        // Wait for an explicit Claude session-start hook; if startup stalls, retry once.
+        // Wait for Claude session-start hook to mark REPL as ready.
         scheduleStartupTimeout()
     }
 
@@ -89,17 +91,7 @@ final class WeaTerminalBridge {
         guard !replReady else { return }
         guard !Task.isCancelled else { return }
 
-        if startupRetryCount < launcherCommands.count {
-            let command = launcherCommands[startupRetryCount]
-            startupRetryCount += 1
-            weaLog("[Bridge:\(sessionKey)] Claude session-start timeout, retrying launch (\(startupRetryCount)/\(launcherCommands.count))")
-            weaLog("[Bridge:\(sessionKey)] Retry launcher command: \(command)")
-            panel.sendInput(command + "\n")
-            scheduleStartupTimeout()
-            return
-        }
-
-        weaLog("[Bridge:\(sessionKey)] Claude failed to initialize (no session-start hook)")
+        weaLog("[Bridge:\(sessionKey)] Claude failed to initialize (no session-start hook after \(startupTimeoutSeconds)s)")
         await failPendingStartup()
     }
 
@@ -129,49 +121,54 @@ final class WeaTerminalBridge {
         startupTimeoutTask = nil
         weaLog("[Bridge:\(sessionKey)] REPL marked as ready, pending=\(pendingMessages.count)")
 
-        // Flush pending messages
+        // Flush pending messages (queued during startup before REPL was ready)
         guard state != .processing, state != .waitingInput else { return }
         if let first = pendingMessages.first {
             pendingMessages.removeFirst()
-            Task { await doInjectMessage(first) }
+            Task { await injectMessage(first) }
         }
     }
 
     // MARK: - Inject WEA message into terminal
 
     func injectMessage(_ text: String) async {
+        // Queue if Claude process isn't ready yet (startup / relaunch).
         if !replReady {
             weaLog("[Bridge:\(sessionKey)] REPL not ready, queueing: \(text.prefix(50))")
             pendingMessages.append(text)
             return
         }
 
-        if state == .processing {
-            weaLog("[Bridge:\(sessionKey)] Busy processing, queueing: \(text.prefix(50))")
-            pendingMessages.append(text)
+        // If Claude is waiting for input (permission question), this is a reply
+        // to the current turn — not a new command. Don't increment pendingReplyCount
+        // or create a new thinking card; just forward to terminal.
+        if state == .waitingInput {
+            weaLog("[Bridge:\(sessionKey)] Injecting reply to question: \(text.prefix(80))")
+            state = .processing
+            panel.sendInput(text + "\n")
             return
         }
 
-        await doInjectMessage(text)
-    }
+        pendingReplyCount += 1
+        weaLog("[Bridge:\(sessionKey)] Injecting (state=\(state), pending=\(pendingReplyCount)): \(text.prefix(80))")
 
-    private func doInjectMessage(_ text: String) async {
+        // Always forward to terminal immediately.
+        panel.sendInput(text + "\n")
+
+        // Every injected message gets its own thinking card in the FIFO queue.
         state = .processing
         writeMarker()
-        weaLog("[Bridge:\(sessionKey)] Injecting message: \(text.prefix(100))")
 
-        // Send initial "thinking..." card to WEA
         do {
-            activeCardId = try await httpClient.sendCard(
+            let cardId = try await httpClient.sendCard(
                 content: "⏳ thinking...",
                 dest: dest
             )
+            thinkingCardIds.append(cardId)
+            weaLog("[Bridge:\(sessionKey)] Sent thinking card, id=\(cardId)")
         } catch {
-            logger.error("Failed to send thinking card: \(error.localizedDescription)")
+            weaLog("[Bridge:\(sessionKey)] Failed to send thinking card: \(error.localizedDescription)")
         }
-
-        // Inject the message text into the terminal + Enter
-        panel.sendInput(text + "\n")
     }
 
     // MARK: - Hook Callbacks (called by WeaBotService)
@@ -180,54 +177,97 @@ final class WeaTerminalBridge {
     func onClaudeStop(transcriptPath: String?, lastMessage: String?) async {
         guard state == .processing || state == .waitingInput else { return }
 
-        // Read full reply from transcript if available
-        let fullReply: String
-        if let path = transcriptPath {
-            fullReply = readLastAssistantMessage(from: path) ?? lastMessage ?? ""
+        pendingReplyCount = max(0, pendingReplyCount - 1)
+
+        // Read full reply from transcript if available (includes images)
+        let content: AssistantContent
+        if let path = transcriptPath, let parsed = readLastAssistantContent(from: path) {
+            content = parsed
         } else {
-            fullReply = lastMessage ?? ""
+            content = AssistantContent(text: lastMessage ?? "", images: [])
         }
 
-        weaLog("[Bridge:\(sessionKey)] Claude stopped, reply=\(fullReply.count) chars")
+        weaLog("[Bridge:\(sessionKey)] Claude stopped, text=\(content.text.count) chars, images=\(content.images.count), pending=\(pendingReplyCount), cards=\(thinkingCardIds.count)")
 
-        guard !fullReply.isEmpty else {
-            finishProcessing()
-            return
-        }
-
-        // Send final reply to WEA
-        do {
-            if let cardId = activeCardId {
-                try await httpClient.refreshCard(cardId: cardId, content: fullReply, dest: dest)
+        // Send text reply
+        if !content.text.isEmpty {
+            let cardId = thinkingCardIds.isEmpty ? nil : thinkingCardIds.removeFirst()
+            if let cardId {
+                do {
+                    try await httpClient.refreshCard(cardId: cardId, content: content.text, dest: dest)
+                } catch {
+                    weaLog("[Bridge:\(sessionKey)] Refresh failed: \(error.localizedDescription)")
+                    try? await httpClient.sendReply(text: content.text, dest: dest)
+                }
             } else {
-                try await httpClient.sendReply(text: fullReply, dest: dest)
+                do {
+                    try await httpClient.sendReply(text: content.text, dest: dest)
+                } catch {
+                    weaLog("[Bridge:\(sessionKey)] Failed to send reply: \(error.localizedDescription)")
+                }
             }
-        } catch {
-            logger.error("Failed to send reply to WEA: \(error.localizedDescription)")
         }
 
-        finishProcessing()
+        // Send images sequentially
+        for (i, image) in content.images.enumerated() {
+            guard let imageData = Data(base64Encoded: image.base64Data) else {
+                weaLog("[Bridge:\(sessionKey)] Failed to decode base64 image \(i)")
+                continue
+            }
+            let ext = image.mediaType.components(separatedBy: "/").last ?? "png"
+            let fileName = "claude-image-\(i + 1).\(ext)"
+            do {
+                try await httpClient.sendAttachment(
+                    data: imageData,
+                    fileName: fileName,
+                    contentType: image.mediaType,
+                    dest: dest
+                )
+                weaLog("[Bridge:\(sessionKey)] Sent image \(i + 1)/\(content.images.count): \(fileName) (\(imageData.count)B)")
+            } catch {
+                weaLog("[Bridge:\(sessionKey)] Failed to send image \(i + 1): \(error.localizedDescription)")
+            }
+        }
+
+        // Only go idle when all injected messages have been replied to.
+        if pendingReplyCount <= 0 {
+            finishProcessing()
+        }
     }
 
     /// Called when Claude needs user input (Notification hook).
+    /// Refreshes the current thinking card to show the question.
     func onNeedsInput(question: String) async {
         state = .waitingInput
-
-        do {
-            try await httpClient.sendReply(text: question, dest: dest)
-        } catch {
-            logger.error("Failed to forward question to WEA: \(error.localizedDescription)")
-        }
+        await refreshOrSendCard(content: question, label: "input request")
     }
 
     /// Called when PreToolUse fires AskUserQuestion.
+    /// Refreshes the current thinking card to show the question.
     func onAskUserQuestion(questionText: String) async {
         state = .waitingInput
+        await refreshOrSendCard(content: questionText, label: "AskUserQuestion")
+    }
 
+    /// Refresh the latest thinking card with content, or send a new card if none exists.
+    private func refreshOrSendCard(content: String, label: String) async {
+        if let cardId = thinkingCardIds.last {
+            do {
+                weaLog("[Bridge:\(sessionKey)] Refreshing thinking card for \(label): \(content.prefix(100))")
+                try await httpClient.refreshCard(cardId: cardId, content: content, dest: dest)
+                // Remove from queue so the reply creates a new card instead of overwriting this one.
+                thinkingCardIds.removeAll { $0 == cardId }
+                return
+            } catch {
+                weaLog("[Bridge:\(sessionKey)] Refresh failed for \(label): \(error.localizedDescription)")
+            }
+        }
+        // Fallback: send as new card
         do {
-            try await httpClient.sendReply(text: questionText, dest: dest)
+            weaLog("[Bridge:\(sessionKey)] Sending \(label) as new card: \(content.prefix(100))")
+            try await httpClient.sendCard(content: content, dest: dest)
         } catch {
-            logger.error("Failed to forward AskUserQuestion to WEA: \(error.localizedDescription)")
+            weaLog("[Bridge:\(sessionKey)] Failed to send \(label): \(error.localizedDescription)")
         }
     }
 
@@ -235,11 +275,16 @@ final class WeaTerminalBridge {
     func injectQuestionReply(_ reply: String) {
         guard state == .waitingInput else { return }
         state = .processing
+        weaLog("[Bridge:\(sessionKey)] Injecting reply: '\(reply)'")
         panel.sendInput(reply + "\n")
     }
 
     /// Called by claude-hook when SessionStart fires.
-    func startTranscriptWatch(path: String?) {
+    func startTranscriptWatch(path: String?, sessionId: String? = nil) {
+        if let sessionId, !sessionId.isEmpty {
+            claudeSessionId = sessionId
+            weaLog("[Bridge:\(sessionKey)] Claude session ID: \(sessionId)")
+        }
         if let path, !path.isEmpty {
             weaLog("[Bridge:\(sessionKey)] Transcript: \(path)")
         } else {
@@ -261,29 +306,53 @@ final class WeaTerminalBridge {
         weaLog("[Bridge:\(sessionKey)] Process exited, bridge marked dead")
     }
 
+    /// Restart Claude in the same terminal panel after process died.
+    func restartClaude(command: String) {
+        guard !command.isEmpty else { return }
+        processAlive = true
+        replReady = false
+        panel.sendInput(command + "\n")
+        scheduleStartupTimeout()
+        weaLog("[Bridge:\(sessionKey)] Restarting Claude: \(command.prefix(80))")
+    }
+
     // MARK: - Finish & Queue
 
     private func finishProcessing() {
         state = .idle
         activeCardId = nil
+        thinkingCardIds.removeAll()
+        pendingReplyCount = 0
         cleanupMarker()
 
-        // Process next queued message
+        // Process next queued message (from startup queue)
         if let next = pendingMessages.first {
             pendingMessages.removeFirst()
             Task {
-                await doInjectMessage(next)
+                await injectMessage(next)
             }
         }
     }
 
     // MARK: - Read full assistant message from transcript
 
-    private func readLastAssistantMessage(from path: String) -> String? {
+    private struct AssistantContent {
+        let text: String
+        let images: [ImageBlock]
+
+        struct ImageBlock {
+            let mediaType: String   // e.g. "image/png"
+            let base64Data: String
+        }
+
+        var isEmpty: Bool { text.isEmpty && images.isEmpty }
+    }
+
+    private func readLastAssistantContent(from path: String) -> AssistantContent? {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let content = String(data: data, encoding: .utf8) else { return nil }
 
-        var lastText: String?
+        var lastContent: AssistantContent?
         for line in content.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty,
@@ -293,19 +362,32 @@ final class WeaTerminalBridge {
                   let role = message["role"] as? String,
                   role == "assistant" else { continue }
 
+            var texts: [String] = []
+            var images: [AssistantContent.ImageBlock] = []
+
             if let contentArr = message["content"] as? [[String: Any]] {
-                let texts = contentArr.compactMap { block -> String? in
-                    guard (block["type"] as? String) == "text",
-                          let t = block["text"] as? String else { return nil }
-                    return t
+                for block in contentArr {
+                    let blockType = block["type"] as? String ?? ""
+                    if blockType == "text", let t = block["text"] as? String, !t.isEmpty {
+                        texts.append(t)
+                    } else if blockType == "image",
+                              let source = block["source"] as? [String: Any],
+                              (source["type"] as? String) == "base64",
+                              let mediaType = source["media_type"] as? String,
+                              let b64 = source["data"] as? String, !b64.isEmpty {
+                        images.append(.init(mediaType: mediaType, base64Data: b64))
+                    }
                 }
-                let joined = texts.joined(separator: "\n")
-                if !joined.isEmpty { lastText = joined }
             } else if let contentStr = message["content"] as? String, !contentStr.isEmpty {
-                lastText = contentStr
+                texts.append(contentStr)
+            }
+
+            let joined = texts.joined(separator: "\n")
+            if !joined.isEmpty || !images.isEmpty {
+                lastContent = AssistantContent(text: joined, images: images)
             }
         }
-        return lastText
+        return lastContent
     }
 
     // MARK: - Marker file for hook discrimination

@@ -60,6 +60,7 @@ final class WeaBotService: ObservableObject {
 
         if let tabManager {
             workspaceManager = WeaWorkspaceManager(tabManager: tabManager)
+            reconnectRestoredWorkspaces(tabManager: tabManager)
         }
 
         httpClient = WeaHttpClient(appId: config.appId, appSecret: secret, botId: config.botId)
@@ -71,14 +72,44 @@ final class WeaBotService: ObservableObject {
         webSocket.disconnect()
         bridges.removeAll()
         workspaceSessionKeys.removeAll()
-        registry.removeAll()
+        // Don't clear the file-based registry — it's useful for restart reconnection.
+        // Don't close WeA workspaces — they persist across disconnect/reconnect and app restarts.
         httpClient = nil
-        workspaceManager?.closeAllWeaWorkspaces()
         workspaceManager = nil
         state = .stopped
     }
 
+    // MARK: - Restored Workspace Reconnection
+
+    /// Pre-populate workspace→sessionKey mappings for WeA workspaces that were restored
+    /// from the session snapshot. Bridges are created lazily when the first message arrives.
+    private func reconnectRestoredWorkspaces(tabManager: TabManager) {
+        for workspace in tabManager.tabs {
+            guard let groupId = workspace.weaGroupId else { continue }
+            let sessionKey = sessionKey(for: groupId)
+            workspaceSessionKeys[workspace.id.uuidString.lowercased()] = sessionKey
+            logger.info("Reconnected restored WEA workspace '\(workspace.title)' for \(groupId)")
+        }
+    }
+
+    /// Derive a session key from a group ID. Group messages use "group:{id}",
+    /// DM sessions use "direct:{wuid}". For restored workspaces where we don't
+    /// know the chat type, we inspect the groupId format to determine the key.
+    private func sessionKey(for groupId: String) -> String {
+        // The groupId stored on the workspace is the raw group/wuid value.
+        // During routeDirectMessage we use "direct:{wuid}" and in routeGroupMessage "group:{groupId}".
+        // For restored workspaces, check if the registry has an entry to determine the prefix.
+        // Fall back to "group:" since that's the most common case.
+        if let entry = registry.entry(for: "direct:\(groupId)") {
+            return "direct:\(entry.groupId)"
+        }
+        return "group:\(groupId)"
+    }
+
     // MARK: - Message Routing
+
+    /// Messages older than this (in milliseconds) are dropped on reconnect to avoid backlog noise.
+    private static let staleMessageThresholdMs: Int64 = 30_000
 
     private func handleInboundMessage(_ payload: [String: Any]) {
         let config = WeaBotConfig.shared
@@ -86,6 +117,14 @@ final class WeaBotService: ObservableObject {
         do {
             message = try WeaMessageParser.parse(payload, botId: config.botId)
         } catch {
+            return
+        }
+
+        // Drop stale messages that arrive as backlog on WebSocket reconnect.
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let ageMs = nowMs - message.timestamp
+        if ageMs > Self.staleMessageThresholdMs {
+            logger.info("Dropping stale WEA message (age=\(ageMs)ms): \(message.text.prefix(40))")
             return
         }
 
@@ -123,11 +162,16 @@ final class WeaBotService: ObservableObject {
         let bridge: WeaTerminalBridge
 
         if let existing = bridges[sessionKey] {
-            // Recreate if terminal panel is gone OR Claude process exited.
             let panelLive = workspaceManager?.hasLiveTerminalPanel(groupId: groupId, panelId: existing.panelId) == true
             if panelLive && existing.processAlive {
                 bridge = existing
+            } else if panelLive && !existing.processAlive {
+                // Panel exists but Claude died — restart Claude in the same terminal.
+                logger.info("Restarting Claude in existing panel for \(sessionKey)")
+                existing.restartClaude(command: workspaceManager?.launchCommand(for: groupId) ?? "")
+                bridge = existing
             } else {
+                // Panel gone — recreate everything.
                 logger.info("Recreating bridge for \(sessionKey): panelLive=\(panelLive) processAlive=\(existing.processAlive)")
                 bridges.removeValue(forKey: sessionKey)
                 registry.markDead(sessionKey: sessionKey)
@@ -150,12 +194,8 @@ final class WeaBotService: ObservableObject {
 
         registry.touchMessage(sessionKey: sessionKey)
 
-        if bridge.state == .waitingInput {
-            bridge.injectQuestionReply(message.text)
-        } else {
-            Task {
-                await bridge.injectMessage(message.text)
-            }
+        Task {
+            await bridge.injectMessage(message.text)
         }
     }
 
@@ -163,19 +203,21 @@ final class WeaBotService: ObservableObject {
         guard let httpClient, let workspaceManager else { return nil }
         let dest = WeaMessageParser.replyDest(for: message)
 
-        guard let panel = workspaceManager.findOrCreatePanel(groupId: groupId, displayName: displayName) else {
+        // Check if the workspace was restored from a previous session and has a saved Claude session ID.
+        let claudeSessionId = workspaceManager.workspace(for: groupId)?.claudeSessionId
+
+        guard let panel = workspaceManager.findOrCreatePanel(groupId: groupId, displayName: displayName, claudeSessionId: claudeSessionId) else {
             return nil
         }
 
         workspaceSessionKeys[panel.workspaceId.uuidString.lowercased()] = sessionKey
-        registry.register(sessionKey: sessionKey, groupId: groupId, displayName: displayName)
+        registry.register(sessionKey: sessionKey, groupId: groupId, displayName: displayName, workspaceId: panel.workspaceId, panelId: panel.id)
 
         return WeaTerminalBridge(
             sessionKey: sessionKey,
             panel: panel,
             httpClient: httpClient,
-            dest: dest,
-            launcherCommands: workspaceManager.claudeRetryCommands(for: groupId)
+            dest: dest
         )
     }
 
@@ -214,14 +256,70 @@ final class WeaBotService: ObservableObject {
         }
     }
 
-    func handleSessionStart(workspaceId: String, transcriptPath: String?) {
+    func handleSessionStart(workspaceId: String, transcriptPath: String?, sessionId: String? = nil) {
         if let bridge = bridge(forWorkspaceId: workspaceId) {
-            bridge.startTranscriptWatch(path: transcriptPath)
+            bridge.startTranscriptWatch(path: transcriptPath, sessionId: sessionId)
+            storeClaudeSessionId(sessionId, forWorkspaceId: workspaceId)
             return
         }
         for bridge in bridges.values where bridge.isWeaMessageActive {
-            bridge.startTranscriptWatch(path: transcriptPath)
+            bridge.startTranscriptWatch(path: transcriptPath, sessionId: sessionId)
             return
+        }
+    }
+
+    private func storeClaudeSessionId(_ sessionId: String?, forWorkspaceId workspaceId: String) {
+        guard let sessionId, !sessionId.isEmpty else { return }
+        let normalized = workspaceId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let workspace = tabManager?.tabs.first(where: { $0.id.uuidString.lowercased() == normalized }) else { return }
+        workspace.claudeSessionId = sessionId
+    }
+
+    // MARK: - File Sending
+
+    /// Send a file to WEA on behalf of a workspace's Claude session.
+    /// Called by the `wea_send_file` socket command.
+    func handleSendFile(workspaceId: String, filePath: String, body: String) async {
+        guard let bridge = bridge(forWorkspaceId: workspaceId),
+              let httpClient else {
+            logger.error("Cannot send file: no bridge for workspace \(workspaceId)")
+            return
+        }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath)) else {
+            logger.error("Cannot read file at \(filePath)")
+            return
+        }
+        let fileName = (filePath as NSString).lastPathComponent
+        let contentType = Self.mimeType(for: fileName)
+        do {
+            try await httpClient.sendAttachment(
+                data: data,
+                fileName: fileName,
+                contentType: contentType,
+                dest: bridge.dest,
+                body: body
+            )
+            logger.info("Sent file \(fileName) (\(data.count)B) to WEA for \(bridge.sessionKey)")
+        } catch {
+            logger.error("Failed to send file \(fileName): \(error.localizedDescription)")
+        }
+    }
+
+    private static func mimeType(for fileName: String) -> String {
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        switch ext {
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "svg": return "image/svg+xml"
+        case "pdf": return "application/pdf"
+        case "zip": return "application/zip"
+        case "txt", "log", "md": return "text/plain"
+        case "json": return "application/json"
+        case "csv": return "text/csv"
+        case "html", "htm": return "text/html"
+        default: return "application/octet-stream"
         }
     }
 

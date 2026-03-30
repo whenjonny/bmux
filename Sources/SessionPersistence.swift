@@ -340,6 +340,10 @@ struct SessionWorkspaceSnapshot: Codable, Sendable {
     var logEntries: [SessionLogEntrySnapshot]
     var progress: SessionProgressSnapshot?
     var gitBranch: SessionGitBranchSnapshot?
+    /// Non-nil if this workspace is a WEA chat session (group ID or DM wuid).
+    var weaGroupId: String?
+    /// Claude Code session ID for resuming conversations with `--resume`.
+    var claudeSessionId: String?
 }
 
 struct SessionTabManagerSnapshot: Codable, Sendable {

@@ -1,36 +1,50 @@
-<h1 align="center">cmux</h1>
-<p align="center">A Ghostty-based macOS terminal with vertical tabs and notifications for AI coding agents</p>
+<div align="center">
+<img src="./docs/assets/app-icon.png" width="128" />
 
-<p align="center">
-  <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-    <img src="./docs/assets/macos-badge.png" alt="Download cmux for macOS" width="180" />
-  </a>
-</p>
+# cmux
 
-<p align="center">
-  English | <a href="README.ja.md">日本語</a> | <a href="README.vi.md">Tiếng Việt</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a> | <a href="README.it.md">Italiano</a> | <a href="README.da.md">Dansk</a> | <a href="README.pl.md">Polski</a> | <a href="README.ru.md">Русский</a> | <a href="README.bs.md">Bosanski</a> | <a href="README.ar.md">العربية</a> | <a href="README.no.md">Norsk</a> | <a href="README.pt-BR.md">Português (Brasil)</a> | <a href="README.th.md">ไทย</a> | <a href="README.tr.md">Türkçe</a> | <a href="README.km.md">ភាសាខ្មែរ</a> | <a href="README.uk.md">Українська</a>
-</p>
+**Native macOS AI Terminal + WEA Bot**
 
-<p align="center">
-  <a href="https://x.com/manaflowai"><img src="https://img.shields.io/badge/@manaflow-555?logo=x" alt="X / Twitter" /></a>
-  <a href="https://discord.gg/xsgFEVrWCZ"><img src="https://img.shields.io/badge/Discord-555?logo=discord" alt="Discord" /></a>
-</p>
+A Ghostty-based native macOS terminal with integrated Difft (WEA) IM Bot, bringing AI coding agents to your fingertips.
 
-<p align="center">
-  <img src="./docs/assets/main-first-image.png" alt="cmux screenshot" width="900" />
-</p>
+[![Download](https://img.shields.io/badge/Download-macOS%20DMG-blue?style=for-the-badge&logo=apple)](https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg)
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=i-WxO5YUTOs">▶ Demo video</a> · <a href="https://cmux.com/blog/zen-of-cmux">The Zen of cmux</a>
-</p>
+</div>
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Install](#install)
+- [WEA Bot Integration](#wea-bot-integration)
+  - [Bot Application Process](#bot-application-process)
+  - [Configuration](#configuration)
+  - [Architecture](#architecture)
+- [CLI Commands](#cli-commands)
+- [Keyboard Shortcuts](#keyboard-shortcuts)
+- [Development](#development)
+
+---
+
+## Overview
+
+cmux is a native macOS terminal app built with Swift/AppKit, powered by libghostty for GPU-accelerated rendering. On top of standard terminal capabilities, cmux integrates a Difft (WEA) IM Bot: users @mention the Bot in WEA chats, and cmux automatically routes messages to a dedicated Claude Code session, returning AI responses as interactive card messages in real time.
+
+**Philosophy:** The terminal is the best host for AI coding agents. cmux provides composable primitives (terminal, browser, notifications, WEA Bot, CLI) instead of a rigid workflow.
+
+---
 
 ## Features
+
+### Terminal
 
 <table>
 <tr>
 <td width="40%" valign="middle">
-<h3>Notification rings</h3>
-Panes get a blue ring and tabs light up when coding agents need your attention
+<h4>Notification Rings</h4>
+Panes get a blue ring and tabs light up when AI agents need your attention
 </td>
 <td width="60%">
 <img src="./docs/assets/notification-rings.png" alt="Notification rings" width="100%" />
@@ -38,16 +52,7 @@ Panes get a blue ring and tabs light up when coding agents need your attention
 </tr>
 <tr>
 <td width="40%" valign="middle">
-<h3>Notification panel</h3>
-See all pending notifications in one place, jump to the most recent unread
-</td>
-<td width="60%">
-<img src="./docs/assets/sidebar-notification-badge.png" alt="Sidebar notification badge" width="100%" />
-</td>
-</tr>
-<tr>
-<td width="40%" valign="middle">
-<h3>In-app browser</h3>
+<h4>Built-in Browser</h4>
 Split a browser alongside your terminal with a scriptable API ported from <a href="https://github.com/vercel-labs/agent-browser">agent-browser</a>
 </td>
 <td width="60%">
@@ -56,23 +61,36 @@ Split a browser alongside your terminal with a scriptable API ported from <a hre
 </tr>
 <tr>
 <td width="40%" valign="middle">
-<h3>Vertical + horizontal tabs</h3>
-Sidebar shows git branch, linked PR status/number, working directory, listening ports, and latest notification text. Split horizontally and vertically.
+<h4>Vertical + Horizontal Tabs</h4>
+Sidebar shows git branch, PR status, working directory, listening ports, and latest notification
 </td>
 <td width="60%">
-<img src="./docs/assets/vertical-horizontal-tabs-and-splits.png" alt="Vertical tabs and split panes" width="100%" />
+<img src="./docs/assets/vertical-horizontal-tabs-and-splits.png" alt="Vertical tabs" width="100%" />
 </td>
 </tr>
 </table>
 
-- **Scriptable** — CLI and socket API to create workspaces, split panes, send keystrokes, and automate the browser
-- **Native macOS app** — Built with Swift and AppKit, not Electron. Fast startup, low memory.
-- **Ghostty compatible** — Reads your existing `~/.config/ghostty/config` for themes, fonts, and colors
-- **GPU-accelerated** — Powered by libghostty for smooth rendering
+- **Native macOS** -- Swift + AppKit, not Electron. Fast startup, low memory.
+- **GPU-accelerated** -- Powered by libghostty for smooth rendering
+- **Ghostty compatible** -- Reads your existing `~/.config/ghostty/config` for themes, fonts, and colors
+- **Scriptable** -- CLI + Socket API to control workspaces, panes, browser, and keystrokes
+
+### WEA Bot
+
+- **Session isolation** -- Group chats keyed by `groupId`, DMs by `senderWuid`, each with its own Claude Code process
+- **Independent workspaces** -- Each session gets its own workspace directory and `CLAUDE.md`, giving Claude full file read/write capabilities
+- **Interactive cards** -- Difft CARD + REFRESH mechanism for streaming output; users see Claude's real-time thinking process
+- **WebSocket real-time** -- Difft WebSocket API for instant message reception with low-latency response
+- **File/image sending** -- Client-side encrypted upload, supports screenshot sending (`cmux screenshot` + `cmux wea send-file`)
+- **Group blacklist** -- Configurable per-group blocking
+- **Auto-reconnect** -- WebSocket auto-reconnects on disconnect, crashed processes auto-recover
+- **Smart message splitting** -- Long replies split at paragraph/line/word boundaries, respecting Difft's 4KB limit
+
+---
 
 ## Install
 
-### DMG (recommended)
+### DMG (Recommended)
 
 <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
   <img src="./docs/assets/macos-badge.png" alt="Download cmux for macOS" width="180" />
@@ -93,33 +111,263 @@ To update later:
 brew upgrade --cask cmux
 ```
 
-On first launch, macOS may ask you to confirm opening an app from an identified developer. Click **Open** to proceed.
+### Build from Source
 
-## Why cmux?
+```bash
+# 1. Clone with submodules
+git clone --recurse-submodules https://github.com/manaflow-ai/cmux.git
+cd cmux
 
-I run a lot of Claude Code and Codex sessions in parallel. I was using Ghostty with a bunch of split panes, and relying on native macOS notifications to know when an agent needed me. But Claude Code's notification body is always just "Claude is waiting for your input" with no context, and with enough tabs open I couldn't even read the titles anymore.
+# 2. Run setup (initializes submodules and builds GhosttyKit)
+./scripts/setup.sh
 
-I tried a few coding orchestrators but most of them were Electron/Tauri apps and the performance bugged me. I also just prefer the terminal since GUI orchestrators lock you into their workflow. So I built cmux as a native macOS app in Swift/AppKit. It uses libghostty for terminal rendering and reads your existing Ghostty config for themes, fonts, and colors.
+# 3. Build Debug app (tag required for isolated build)
+./scripts/reload.sh --tag my-build
 
-The main additions are the sidebar and notification system. The sidebar has vertical tabs that show git branch, linked PR status/number, working directory, listening ports, and the latest notification text for each workspace. The notification system picks up terminal sequences (OSC 9/99/777) and has a CLI (`cmux notify`) you can wire into agent hooks for Claude Code, OpenCode, etc. When an agent is waiting, its pane gets a blue ring and the tab lights up in the sidebar, so I can tell which one needs me across splits and tabs. Cmd+Shift+U jumps to the most recent unread.
+# 4. Build and launch
+./scripts/reload.sh --tag my-build --launch
+```
 
-The in-app browser has a scriptable API ported from [agent-browser](https://github.com/vercel-labs/agent-browser). Agents can snapshot the accessibility tree, get element refs, click, fill forms, and evaluate JS. You can split a browser pane next to your terminal and have Claude Code interact with your dev server directly.
+Requirements for building from source:
+- macOS 14+
+- Xcode 15+
+- [Zig](https://ziglang.org/download/) (for building GhosttyKit)
 
-Everything is scriptable through the CLI and socket API — create workspaces/tabs, split panes, send keystrokes, open URLs in the browser.
+---
 
-## The Zen of cmux
+## WEA Bot Integration
 
-cmux is not prescriptive about how developers hold their tools. It's a terminal and browser with a CLI, and the rest is up to you.
+### Bot Application Process
 
-cmux is a primitive, not a solution. It gives you a terminal, a browser, notifications, workspaces, splits, tabs, and a CLI to control all of it. cmux doesn't force you into an opinionated way to use coding agents. What you build with the primitives is yours.
+Before using the WEA Bot, you need to register a Bot on the Difft platform and obtain credentials.
 
-The best developers have always built their own tools. Nobody has figured out the best way to work with agents yet, and the teams building closed products definitely haven't either. The developers closest to their own codebases will figure it out first.
+#### Step 1: Search for IMBot
 
-Give a million developers composable primitives and they'll collectively find the most efficient workflows faster than any product team could design top-down.
+In the WEA client, search for **IMBot**:
 
-## Documentation
+| Environment | Search Target |
+|------------|---------------|
+| Test | IMBot (`+22288`) |
+| Production | IMBot (`+10004`) |
 
-For more info on how to configure cmux, [head over to our docs](https://cmux.com/docs/getting-started?utm_source=readme).
+#### Step 2: Apply for a Bot
+
+Open the IMBot conversation, tap **Bot Menu** at the bottom, and select **"Bot Request"** / **"Apply a new bot"**.
+
+#### Step 3: Fill Out the Application
+
+| Field | Requirement | Example |
+|-------|-------------|---------|
+| **Bot Name** | Follow `[Prefix][Function][Suffix]` convention | `ConvertAIAssistant` |
+| **Bot Signature** | Brief description, under 20 characters | `AI Coding Assistant` |
+| **Bot Description** | Detailed description of the Bot's purpose | `Bridge between WEA IM and Claude Code` |
+| **Service Type** | Select **"Extension Service"** | -- |
+
+**Naming convention:**
+
+- **Prefix** -- Department identifier (e.g., `Convert`, `HR`, `Infra`)
+- **Function** -- Feature description (e.g., `AI`, `Recruitment`, `Monitor`)
+- **Suffix** -- Type: `Bot`, `Robot`, `Assistant`, `Monitor`, `Notify`, `Auto`
+
+Submit and wait for approval.
+
+#### Step 4: Receive Credentials
+
+Once approved, you'll receive:
+
+- **AppID** -- Application identifier
+- **BotID** -- Bot identifier
+- **OTP** -- One-time password (valid for 24 hours)
+
+#### Step 5: Exchange OTP for Secret
+
+Use the OTP to obtain a permanent Secret (OTP expires in 24 hours):
+
+**Production:**
+
+```bash
+curl --location 'https://openapi.difft.org/v2/token/secret' \
+  --header 'Authorization: <your_otp>' \
+  --header 'X-Signature-appid: <your_app_id>'
+```
+
+**Test:**
+
+```bash
+curl --location 'https://openapi.test.difft.org/v2/token/secret' \
+  --header 'Authorization: <your_otp>' \
+  --header 'X-Signature-appid: <your_app_id>'
+```
+
+Response:
+
+```json
+{
+  "ver": 1,
+  "status": 0,
+  "reason": "ok",
+  "data": {
+    "app_secret": "Kxxxxxxxxxxxxxxxxxxxxxxxxx6"
+  }
+}
+```
+
+Save the `app_secret` for configuration.
+
+#### Step 6: Enable WebSocket Permission
+
+> **Critical step!** Without this permission, WebSocket connections will be rejected (HTTP 401).
+
+1. Search for **DevOnWea** (`+20035`) in WEA
+2. Request **WebSocket listening permission** from DevOnWea
+3. Provide your **BotID** and **environment** (`test` / `production`)
+
+---
+
+### Configuration
+
+In the cmux app, open **Settings > WEA Bot** to configure.
+
+#### Bot Credentials
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| **App ID** | Application identifier assigned by Difft | `ver2341a46a60429f673` |
+| **App Secret** | Permanent secret obtained via OTP (stored in Keychain) | `WKrUY/P6hMLdeP59...` |
+| **Bot ID** | Bot identifier | `29705` |
+
+#### Behavior Settings
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| **Auto Connect** | Automatically connect to WEA on app launch | `false` |
+| **Sessions Root Path** | Root directory for session workspaces | `{cwd}/wea-sessions` |
+| **Group Blacklist** | List of blocked group IDs | Empty |
+
+#### Usage
+
+- **Direct messages** -- Send a message directly to the Bot; it responds automatically
+- **Group chats** -- @mention the Bot in a group (e.g., `@ConvertAIAssistant write a sorting algorithm`); the Bot only responds to @mentions
+
+---
+
+### Architecture
+
+#### Data Flow
+
+```
+User (WEA Client)
+    |
+    v
+Difft Platform --WebSocket--> WeaWebSocket     (HMAC-SHA256 auth, real-time message reception)
+                                    |
+                                    v
+                              WeaBotService     (message parsing, @mention filtering, session routing)
+                                    |
+                                    +-- WeaSessionRegistry   (session-to-workspace mapping, persistence)
+                                    |
+                                    v
+                              WeaWorkspaceManager -> cmux Workspace + Terminal Panel
+                                    |
+                                    v
+                              WeaTerminalBridge  (message injection -> Claude Code, transcript monitoring)
+                                    |
+                                    +-- Claude Code processing --> text reply
+                                    |
+                                    v
+                              WeaHttpClient      (TEXT / CARD / REFRESH / attachment sending)
+                                    |
+                                    +-- WeaFileUploader    (3-step encrypted upload: isExists -> PUT OSS -> uploadInfo)
+                                    |   +-- WeaFileCrypto  (AES-256-CBC + HMAC-SHA256 + MD5)
+                                    |
+                                    v
+                              Difft Platform --> User (sees reply / file in real time)
+```
+
+#### Session Isolation
+
+| Chat Type | Session Key | Description |
+|-----------|-------------|-------------|
+| Group chat | `group:{groupId}` | All @Bot messages in a group share one Claude Code process |
+| Direct message | `direct:{senderWuid}` | Each user gets a dedicated Claude Code process |
+
+Each session has an independent workspace at `{sessionsRootPath}/{groupId}/`, containing:
+- `CLAUDE.md` -- Session-level prompt that teaches Claude how to use cmux screenshot and file sending capabilities
+- Full file system read/write access
+
+#### File Sending Flow
+
+```
+Claude Code runs:
+  cmux screenshot              -> /tmp/cmux-screenshots/xxx.png
+  cmux wea send-file xxx.png   -> Socket: wea_send_file -> WeaBotService
+                                  -> WeaFileCrypto.encrypt (AES-256-CBC)
+                                  -> WeaFileUploader.upload (3-step)
+                                  -> WeaHttpClient.sendAttachment
+                                  -> WEA user receives image
+```
+
+#### HMAC-SHA256 Signing
+
+All Difft API requests use HMAC-SHA256 signature authentication:
+
+| Header | Description |
+|--------|-------------|
+| `X-Signature-appid` | AppID |
+| `X-Signature-timestamp` | Millisecond timestamp |
+| `X-Signature-nonce` | UUID (hyphens removed) |
+| `X-Signature-algorithm` | Fixed `HmacSHA256` |
+| `X-Signature-signature` | HMAC-SHA256 signature value (hex) |
+
+---
+
+## CLI Commands
+
+cmux provides a CLI tool for scriptable control.
+
+### General
+
+```bash
+cmux notify "message"              # Send notification to current terminal
+cmux screenshot [label]            # Capture cmux window, returns image path
+```
+
+### WEA
+
+```bash
+# Send a file to the current WEA chat
+cmux wea send-file <path>
+
+# Send a file with a caption
+cmux wea send-file /path/to/report.pdf --body "Here's the report"
+
+# Take a screenshot and send it to WEA
+cmux screenshot && cmux wea send-file /tmp/cmux-screenshots/*.png
+```
+
+> `cmux wea send-file` requires the `CMUX_WORKSPACE_ID` environment variable (automatically set in WEA session terminals).
+
+### Workspace Management
+
+```bash
+cmux workspace list               # List all workspaces
+cmux workspace select <id>        # Switch to a workspace
+cmux workspace new [name]         # Create a new workspace
+```
+
+### Socket API
+
+cmux exposes a Unix Domain Socket API (`/tmp/cmux-debug.sock`) for fine-grained control:
+
+```bash
+# Query current window info
+echo "v1 window.current" | nc -U /tmp/cmux-debug.sock
+
+# Send keystrokes to terminal
+echo "v1 input.send {\"text\":\"hello\"}" | nc -U /tmp/cmux-debug.sock
+```
+
+---
 
 ## Keyboard Shortcuts
 
@@ -128,146 +376,104 @@ For more info on how to configure cmux, [head over to our docs](https://cmux.com
 | Shortcut | Action |
 |----------|--------|
 | ⌘ N | New workspace |
-| ⌘ 1–8 | Jump to workspace 1–8 |
+| ⌘ 1-8 | Jump to workspace 1-8 |
 | ⌘ 9 | Jump to last workspace |
-| ⌃ ⌘ ] | Next workspace |
-| ⌃ ⌘ [ | Previous workspace |
+| ⌃ ⌘ ] / [ | Next / previous workspace |
 | ⌘ ⇧ W | Close workspace |
 | ⌘ ⇧ R | Rename workspace |
 | ⌘ B | Toggle sidebar |
 
-### Surfaces
-
-| Shortcut | Action |
-|----------|--------|
-| ⌘ T | New surface |
-| ⌘ ⇧ ] | Next surface |
-| ⌘ ⇧ [ | Previous surface |
-| ⌃ Tab | Next surface |
-| ⌃ ⇧ Tab | Previous surface |
-| ⌃ 1–8 | Jump to surface 1–8 |
-| ⌃ 9 | Jump to last surface |
-| ⌘ W | Close surface |
-
-### Split Panes
+### Panes
 
 | Shortcut | Action |
 |----------|--------|
 | ⌘ D | Split right |
 | ⌘ ⇧ D | Split down |
-| ⌥ ⌘ ← → ↑ ↓ | Focus pane directionally |
-| ⌘ ⇧ H | Flash focused panel |
+| ⌥ ⌘ Arrow keys | Focus pane directionally |
+| ⌘ T | New surface |
+| ⌘ W | Close surface |
 
 ### Browser
-
-Browser developer-tool shortcuts follow Safari defaults and are customizable in `Settings → Keyboard Shortcuts`.
 
 | Shortcut | Action |
 |----------|--------|
 | ⌘ ⇧ L | Open browser in split |
 | ⌘ L | Focus address bar |
-| ⌘ [ | Back |
-| ⌘ ] | Forward |
+| ⌘ [ / ] | Back / forward |
 | ⌘ R | Reload page |
-| ⌥ ⌘ I | Toggle Developer Tools (Safari default) |
-| ⌥ ⌘ C | Show JavaScript Console (Safari default) |
+| ⌥ ⌘ I | Developer tools |
 
 ### Notifications
 
 | Shortcut | Action |
 |----------|--------|
-| ⌘ I | Show notifications panel |
+| ⌘ I | Notification panel |
 | ⌘ ⇧ U | Jump to latest unread |
-
-### Find
-
-| Shortcut | Action |
-|----------|--------|
-| ⌘ F | Find |
-| ⌘ G / ⌘ ⇧ G | Find next / previous |
-| ⌘ ⇧ F | Hide find bar |
-| ⌘ E | Use selection for find |
 
 ### Terminal
 
 | Shortcut | Action |
 |----------|--------|
 | ⌘ K | Clear scrollback |
-| ⌘ C | Copy (with selection) |
+| ⌘ C | Copy |
 | ⌘ V | Paste |
-| ⌘ + / ⌘ - | Increase / decrease font size |
-| ⌘ 0 | Reset font size |
+| ⌘ F | Find |
+| ⌘ + / - | Adjust font size |
 
-### Window
+---
 
-| Shortcut | Action |
-|----------|--------|
-| ⌘ ⇧ N | New window |
-| ⌘ , | Settings |
-| ⌘ ⇧ , | Reload configuration |
-| ⌘ Q | Quit |
+## Development
 
-## Nightly Builds
+### WEA Source Structure
 
-[Download cmux NIGHTLY](https://github.com/manaflow-ai/cmux/releases/download/nightly/cmux-nightly-macos.dmg)
+```
+Sources/Wea/
+├── WeaBotService.swift          # Main service: lifecycle, message routing, session management
+├── WeaBotConfig.swift           # Persistent config: AppID/BotID/Secret(Keychain), blacklist, session path
+├── WeaWebSocket.swift           # WebSocket connection: signed auth, reconnect, heartbeat, message fetch
+├── WeaHttpClient.swift          # HTTP API: TEXT/CARD/REFRESH/attachment message sending
+├── WeaMessageParser.swift       # Message parsing: extract sender/group/content/mention
+├── WeaTerminalBridge.swift      # Terminal bridge: message injection -> Claude Code, transcript monitoring
+├── WeaSessionRegistry.swift     # Session registry: session->workspace mapping, file persistence
+├── WeaWorkspaceManager.swift    # Workspace management: find/create workspace + terminal panel
+├── WeaFileUploader.swift        # File upload: 3-step encrypted upload (isExists -> PUT -> uploadInfo)
+├── WeaFileCrypto.swift          # Crypto utilities: AES-256-CBC + HMAC-SHA256 + MD5
+├── WeaSignature.swift           # HMAC-SHA256 signing (matches @wea/wea-sdk-js)
+└── WeaMessageDest.swift         # Message destination: user/group routing
+```
 
-cmux NIGHTLY is a separate app with its own bundle ID, so it runs alongside the stable version. Built automatically from the latest `main` commit and auto-updates via its own Sparkle feed.
+### Building
 
-Report nightly bugs on [GitHub Issues](https://github.com/manaflow-ai/cmux/issues) or in [#nightly-bugs on Discord](https://discord.gg/xsgFEVrWCZ).
+```bash
+# Initialize submodules and build GhosttyKit
+./scripts/setup.sh
 
-## Session restore (current behavior)
+# Build Debug app (tag required)
+./scripts/reload.sh --tag <tag>
 
-On relaunch, cmux currently restores app layout and metadata only:
-- Window/workspace/pane layout
-- Working directories
-- Terminal scrollback (best effort)
-- Browser URL and navigation history
+# Build and launch
+./scripts/reload.sh --tag <tag> --launch
 
-cmux does **not** restore live process state inside terminal apps. For example, active Claude Code/tmux/vim sessions are not resumed after restart yet.
+# Compile check only
+xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug \
+  -destination 'platform=macOS' -derivedDataPath /tmp/cmux-<tag> build
+```
 
-## Star History
+### Tech Stack
 
-<a href="https://star-history.com/#manaflow-ai/cmux&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=manaflow-ai/cmux&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=manaflow-ai/cmux&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=manaflow-ai/cmux&type=Date" width="600" />
- </picture>
-</a>
+| Technology | Purpose |
+|------------|---------|
+| **Swift / AppKit** | Native macOS UI |
+| **libghostty (Zig)** | GPU-accelerated terminal rendering |
+| **WebSocket** | Difft real-time message reception |
+| **CommonCrypto** | AES-256-CBC file encryption, HMAC-SHA256 signing |
+| **Sparkle** | Auto-updates |
+| **Keychain** | Secure App Secret storage |
 
-## Contributing
-
-Ways to get involved:
-
-- Follow us on X for updates [@manaflowai](https://x.com/manaflowai), [@lawrencecchen](https://x.com/lawrencecchen), and [@austinywang](https://x.com/austinywang)
-- Join the conversation on [Discord](https://discord.gg/xsgFEVrWCZ)
-- Create and participate in [GitHub issues](https://github.com/manaflow-ai/cmux/issues) and [discussions](https://github.com/manaflow-ai/cmux/discussions)
-- Let us know what you're building with cmux
-
-## Community
-
-- [Discord](https://discord.gg/xsgFEVrWCZ)
-- [GitHub](https://github.com/manaflow-ai/cmux)
-- [X / Twitter](https://twitter.com/manaflowai)
-- [YouTube](https://www.youtube.com/channel/UCAa89_j-TWkrXfk9A3CbASw)
-- [LinkedIn](https://www.linkedin.com/company/manaflow-ai/)
-- [Reddit](https://www.reddit.com/r/cmux/)
-
-## Founder's Edition
-
-cmux is free, open source, and always will be. If you'd like to support development and get early access to what's coming next:
-
-**[Get Founder's Edition](https://buy.stripe.com/3cI00j2Ld0it5OU33r5EY0q)**
-
-- **Prioritized feature requests/bug fixes**
-- **Early access: cmux AI that gives you context on every workspace, tab and panel**
-- **Early access: iOS app with terminals synced between desktop and phone**
-- **Early access: Cloud VMs**
-- **Early access: Voice mode**
-- **My personal iMessage/WhatsApp**
+---
 
 ## License
 
 cmux is open source under [AGPL-3.0-or-later](LICENSE).
 
-If your organization cannot comply with AGPL, a commercial license is available. Contact [founders@manaflow.com](mailto:founders@manaflow.com) for details.
+For commercial licensing, contact [founders@manaflow.com](mailto:founders@manaflow.com).

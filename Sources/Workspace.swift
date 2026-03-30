@@ -289,7 +289,9 @@ extension Workspace {
             statusEntries: statusSnapshots,
             logEntries: logSnapshots,
             progress: progressSnapshot,
-            gitBranch: gitBranchSnapshot
+            gitBranch: gitBranchSnapshot,
+            weaGroupId: weaGroupId,
+            claudeSessionId: claudeSessionId
         )
     }
 
@@ -321,6 +323,8 @@ extension Workspace {
         setCustomTitle(snapshot.customTitle)
         setCustomColor(snapshot.customColor)
         isPinned = snapshot.isPinned
+        weaGroupId = snapshot.weaGroupId
+        claudeSessionId = snapshot.claudeSessionId
 
         // Status entries and agent PIDs are ephemeral runtime state tied to running
         // processes (e.g. claude_code "Running"). Don't restore them across app
@@ -5436,6 +5440,8 @@ final class Workspace: Identifiable, ObservableObject {
     @Published var customColor: String?  // hex string, e.g. "#C0392B"
     /// Non-nil if this workspace is a WEA chat session. Stores the WEA group/DM ID.
     var weaGroupId: String?
+    /// Claude Code session ID for the WEA terminal, used for `--resume` on restart.
+    var claudeSessionId: String?
     @Published var currentDirectory: String
     private(set) var preferredBrowserProfileID: UUID?
 

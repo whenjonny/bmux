@@ -115,10 +115,47 @@ final class WeaBotConfig: ObservableObject {
     }
 
     /// Creates and returns the session folder for a given group ID.
+    /// Seeds a CLAUDE.md on first creation so Claude knows about cmux WEA capabilities.
     func sessionFolder(for groupId: String) -> String {
         let root = resolvedSessionsRootPath
         let folder = (root as NSString).appendingPathComponent(groupId)
         try? FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        seedClaudeMd(in: folder)
         return folder
+    }
+
+    private func seedClaudeMd(in folder: String) {
+        let path = (folder as NSString).appendingPathComponent("CLAUDE.md")
+        guard !FileManager.default.fileExists(atPath: path) else { return }
+
+        let content = """
+        # WEA Bot Session
+
+        You are running inside a cmux WEA bot session. User messages come from WEA (IM chat).
+        Your text responses are automatically sent back to the WEA chat.
+
+        ## Sending files/images to the chat
+
+        To send a file or image to the WEA user, use the cmux CLI:
+
+            cmux wea send-file <path>
+
+        Example — take a screenshot and send it:
+
+            cmux screenshot              # captures window, prints "OK <id> <path>"
+            cmux wea send-file /tmp/cmux-screenshots/<filename>.png
+
+        Example — send any file:
+
+            cmux wea send-file /path/to/report.pdf --body "Here's the report"
+
+        The `--body` flag adds a text caption alongside the attachment.
+
+        ## Available cmux commands
+
+        - `cmux screenshot [label]` — capture the cmux window as PNG, returns path
+        - `cmux wea send-file <path> [--body "text"]` — send a file to this WEA chat
+        """
+        try? content.write(toFile: path, atomically: true, encoding: .utf8)
     }
 }

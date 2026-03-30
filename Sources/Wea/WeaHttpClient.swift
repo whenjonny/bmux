@@ -2,6 +2,18 @@
 import Foundation
 import os
 
+private func weaLog(_ message: String) {
+    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+    let path = "/tmp/cmux-wea-debug.log"
+    if let handle = FileHandle(forWritingAtPath: path) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        try? handle.close()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+    }
+}
+
 /// Sends messages (TEXT/CARD/REFRESH) to WEA via Difft OpenAPI.
 final class WeaHttpClient {
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaHttpClient")
@@ -13,6 +25,7 @@ final class WeaHttpClient {
     private let appId: String
     private let appSecret: String
     private let botId: String
+    private lazy var uploader = WeaFileUploader(appId: appId, appSecret: appSecret, botId: botId)
 
     init(appId: String, appSecret: String, botId: String) {
         self.appId = appId
@@ -91,8 +104,10 @@ final class WeaHttpClient {
             "dest": dest.json,
             "timestamp": now,
             "card": [
+                "appID": appId,
                 "id": cardId,
                 "content": String(content.prefix(maxCardLength)),
+                "creator": botId,
                 "version": now,
             ] as [String: Any],
         ]
@@ -123,6 +138,40 @@ final class WeaHttpClient {
         }
     }
 
+    /// Upload a file and send it as a TEXT message with an attachment.
+    func sendAttachment(
+        data: Data,
+        fileName: String,
+        contentType: String,
+        dest: WeaMessageDest,
+        body: String = ""
+    ) async throws {
+        let result = try await uploader.upload(data: data, dest: dest)
+
+        let payload: [String: Any] = [
+            "version": 1,
+            "type": "TEXT",
+            "src": botId,
+            "srcDevice": 1,
+            "dest": dest.json,
+            "timestamp": Int(Date().timeIntervalSince1970 * 1000),
+            "msg": [
+                "body": body,
+                "attachment": [
+                    "contentType": contentType,
+                    "key": result.key,
+                    "authorizeId": result.authorizeId,
+                    "size": result.encryptedSize,
+                    "cipherHash": result.cipherHash,
+                    "fileName": fileName,
+                ] as [String: Any],
+            ] as [String: Any],
+        ]
+
+        weaLog("[HTTP] Sending attachment: \(fileName) (\(contentType), \(data.count)B)")
+        try await sendMessage(payload)
+    }
+
     // MARK: - Private
 
     private func sendMessage(_ payload: [String: Any]) async throws {
@@ -138,16 +187,22 @@ final class WeaHttpClient {
         var request = URLRequest(url: URL(string: "\(baseURL)\(path)")!)
         request.httpMethod = "POST"
         request.httpBody = jsonData
-        request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json;charset=utf-8", forHTTPHeaderField: "Content-Type")
         for (key, value) in signed.httpHeaders {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
+        let msgType = payload["type"] as? String ?? "?"
+        weaLog("[HTTP] Sending \(msgType), body=\(jsonStr.prefix(300))")
+
         let (data, response) = try await session.data(for: request)
-        if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode >= 400 {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            logger.error("WEA API error \(httpResponse.statusCode): \(body)")
-            throw WeaError.apiError(statusCode: httpResponse.statusCode, body: body)
+        let respBody = String(data: data, encoding: .utf8) ?? ""
+        if let httpResponse = response as? HTTPURLResponse {
+            weaLog("[HTTP] Response \(msgType): status=\(httpResponse.statusCode) body=\(respBody.prefix(500))")
+            if httpResponse.statusCode >= 400 {
+                logger.error("WEA API error \(httpResponse.statusCode): \(respBody)")
+                throw WeaError.apiError(statusCode: httpResponse.statusCode, body: respBody)
+            }
         }
     }
 
