@@ -38,6 +38,10 @@ final class WeaBotConfig: ObservableObject {
         didSet { UserDefaults.standard.set(sessionsRootPath, forKey: Self.sessionsRootPathKey) }
     }
 
+    /// Messages older than this threshold (in milliseconds) are considered stale and skipped.
+    /// Default: 120,000ms (2 minutes).
+    var staleMessageThresholdMs: Int64 = 120_000
+
     var isConfigured: Bool {
         !appId.isEmpty && !botId.isEmpty && loadSecret() != nil
     }
@@ -115,12 +119,14 @@ final class WeaBotConfig: ObservableObject {
     }
 
     /// Creates and returns the session folder for a given group ID.
-    /// Seeds a CLAUDE.md on first creation so Claude knows about cmux WEA capabilities.
+    /// Seeds CLAUDE.md and journal.md on first creation.
     func sessionFolder(for groupId: String) -> String {
         let root = resolvedSessionsRootPath
         let folder = (root as NSString).appendingPathComponent(groupId)
         try? FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
         seedClaudeMd(in: folder)
+        seedJournal(in: folder)
+        updateJournalIndex(in: folder, currentGroupId: groupId)
         return folder
     }
 
@@ -133,6 +139,34 @@ final class WeaBotConfig: ObservableObject {
 
         You are running inside a cmux WEA bot session. User messages come from WEA (IM chat).
         Your text responses are automatically sent back to the WEA chat.
+
+        ## Context recovery priority
+
+        When starting a session, recover context in this order:
+        1. **Session resume** — if `--resume` was used, full conversation history is already loaded. Skip to user's message.
+        2. **journal.md** — read `journal.md` in this directory for prior session history. This is your persistent memory across sessions.
+        3. **Parent CLAUDE.md** — project-level instructions are inherited automatically from the parent directory.
+
+        ## Journal protocol
+
+        `journal.md` is your persistent memory. It survives session restarts and context compression.
+
+        **On session start:** Read `journal.md` to understand what happened in prior sessions.
+
+        **After completing significant work:** Append an entry to `journal.md`:
+
+        ```
+        ## YYYY-MM-DD HH:MM — [Topic]
+        **Context:** What was discussed or requested
+        **Done:** What was accomplished
+        **Decisions:** Key decisions made (and why)
+        **Status:** Current state
+        **Next:** What should happen next
+        ```
+
+        **After context compression:** Re-read `journal.md` to recover key details that were lost.
+
+        Keep entries concise (5-10 lines). Focus on decisions and state, not conversation replay.
 
         ## Sending files/images to the chat
 
@@ -157,5 +191,81 @@ final class WeaBotConfig: ObservableObject {
         - `cmux wea send-file <path> [--body "text"]` — send a file to this WEA chat
         """
         try? content.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    private func seedJournal(in folder: String) {
+        let path = (folder as NSString).appendingPathComponent("journal.md")
+        guard !FileManager.default.fileExists(atPath: path) else { return }
+
+        let content = """
+        # Session Journal
+
+        Persistent context log for this WEA chat session.
+        Append entries after completing significant work. Read on session start.
+
+        ---
+
+        """
+        try? content.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    /// Updates the cross-session journal index section in CLAUDE.md.
+    /// Scans sibling session directories for journal.md files and writes
+    /// a machine-readable index so the bot can discover cross-session context.
+    private func updateJournalIndex(in folder: String, currentGroupId: String) {
+        let claudeMdPath = (folder as NSString).appendingPathComponent("CLAUDE.md")
+        guard FileManager.default.fileExists(atPath: claudeMdPath),
+              var content = try? String(contentsOfFile: claudeMdPath, encoding: .utf8) else { return }
+
+        let root = resolvedSessionsRootPath
+        let fm = FileManager.default
+        guard let siblings = try? fm.contentsOfDirectory(atPath: root) else { return }
+
+        let startMarker = "<!-- JOURNAL_INDEX_START -->"
+        let endMarker = "<!-- JOURNAL_INDEX_END -->"
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd"
+
+        var entries: [String] = []
+        for sibling in siblings.sorted() {
+            guard sibling != currentGroupId else { continue }
+            let journalPath = (root as NSString)
+                .appendingPathComponent(sibling)
+                .appending("/journal.md")
+            guard fm.fileExists(atPath: journalPath) else { continue }
+
+            let displayName: String
+            if let name = knownGroups[sibling], !name.isEmpty {
+                displayName = "\(name) (\(sibling))"
+            } else {
+                displayName = sibling
+            }
+
+            var dateStr = ""
+            if let attrs = try? fm.attributesOfItem(atPath: journalPath),
+               let modified = attrs[.modificationDate] as? Date {
+                dateStr = " (updated: \(dateFormatter.string(from: modified)))"
+            }
+            entries.append("- `../\(sibling)/journal.md` — \(displayName)\(dateStr)")
+        }
+
+        var indexSection = "\(startMarker)\n\n## Cross-session journal index\n\n"
+        if entries.isEmpty {
+            indexSection += "No other sessions found yet.\n"
+        } else {
+            indexSection += "Other WEA sessions maintain their own journals. Read these for cross-session context:\n\n"
+            indexSection += entries.joined(separator: "\n") + "\n"
+        }
+        indexSection += "\n\(endMarker)"
+
+        // Replace existing index or append.
+        if let startRange = content.range(of: startMarker),
+           let endRange = content.range(of: endMarker) {
+            content.replaceSubrange(startRange.lowerBound..<endRange.upperBound, with: indexSection)
+        } else {
+            content += "\n\n\(indexSection)\n"
+        }
+
+        try? content.write(toFile: claudeMdPath, atomically: true, encoding: .utf8)
     }
 }

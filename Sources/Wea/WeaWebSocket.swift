@@ -37,6 +37,9 @@ final class WeaWebSocket: NSObject {
 
     var onMessage: (([String: Any]) -> Void)?
     var onStateChange: ((ConnectionState) -> Void)?
+    /// Fired when transitioning from `.reconnecting` to `.connected`.
+    var onReconnected: (() -> Void)?
+    @Published private(set) var reconnectCount: Int = 0
 
     @Published private(set) var state: ConnectionState = .disconnected {
         didSet {
@@ -47,7 +50,15 @@ final class WeaWebSocket: NSObject {
     }
 
     func connect(appId: String, appSecret: String) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.connect(appId: appId, appSecret: appSecret)
+            }
+            return
+        }
+
         intentionalDisconnect = false
+        cleanup()
         state = .connecting
 
         let signed = WeaSignature.signWebSocket(appId: appId, appSecret: appSecret)
@@ -85,10 +96,17 @@ final class WeaWebSocket: NSObject {
     }
 
     private func onConnected() {
+        let wasReconnecting = state == .reconnecting
         state = .connected
         reconnectAttempt = 0
         startPingLoop()
         sendFetch()
+
+        if wasReconnecting {
+            reconnectCount += 1
+            weaLog("[WeaWebSocket] Reconnected (count: \(reconnectCount))")
+            onReconnected?()
+        }
     }
 
     private func sendFetch() {
@@ -110,7 +128,9 @@ final class WeaWebSocket: NSObject {
                 self.receiveNext()
             case .failure(let error):
                 self.logger.error("WebSocket receive error: \(error.localizedDescription)")
-                self.scheduleReconnect()
+                DispatchQueue.main.async { [weak self] in
+                    self?.scheduleReconnect()
+                }
             }
         }
     }
@@ -158,14 +178,25 @@ final class WeaWebSocket: NSObject {
     }
 
     private func scheduleReconnect() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.scheduleReconnect()
+            }
+            return
+        }
+
         guard !intentionalDisconnect else { return }
+        guard reconnectTimer == nil else { return }
+
         cleanup()
         state = .reconnecting
-        let delay = min(baseReconnectInterval * pow(2.0, Double(reconnectAttempt)), maxReconnectInterval)
+        let baseDelay = min(baseReconnectInterval * pow(2.0, Double(reconnectAttempt)), maxReconnectInterval)
+        let delay = baseDelay * (0.8 + Double.random(in: 0...0.4))
         reconnectAttempt += 1
-        weaLog("[WeaWebSocket] Scheduling reconnect in \(delay)s (attempt \(reconnectAttempt))")
+        weaLog("[WeaWebSocket] Scheduling reconnect in \(String(format: "%.1f", delay))s (attempt \(reconnectAttempt))")
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             guard let self, !self.intentionalDisconnect else { return }
+            self.reconnectTimer = nil
             let config = WeaBotConfig.shared
             guard let secret = config.loadSecret(), !config.appId.isEmpty else { return }
             self.connect(appId: config.appId, appSecret: secret)
