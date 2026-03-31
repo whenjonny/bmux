@@ -1,5 +1,13 @@
 import Foundation
 
+// MARK: - WEA command detection
+
+/// Slash commands recognised in inbound WEA messages.
+enum WeaCommand: String {
+    case done = "/done"
+    case summarize = "/summarize"
+}
+
 // MARK: - Parsed message
 
 /// A structured representation of an inbound WEA (Difft) webhook payload.
@@ -43,6 +51,7 @@ struct WeaParsedMessage {
     let groupId: String?
     let topicId: String?
     let isMentionBot: Bool
+    let command: WeaCommand?
 
     /// The raw JSON dictionary for fields we don't parse.
     let rawPayload: [String: Any]
@@ -186,6 +195,17 @@ enum WeaMessageParser {
         // --- Topic ID
         let topicId = extractTopicId(payload)
 
+        // --- Command detection
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let command: WeaCommand?
+        if trimmedText.hasPrefix("/done") {
+            command = .done
+        } else if trimmedText.hasPrefix("/summarize") {
+            command = .summarize
+        } else {
+            command = nil
+        }
+
         return WeaParsedMessage(
             messageId: messageId,
             senderWuid: senderWuid,
@@ -196,6 +216,7 @@ enum WeaMessageParser {
             groupId: groupId,
             topicId: topicId,
             isMentionBot: isMentionBot,
+            command: command,
             rawPayload: payload
         )
     }

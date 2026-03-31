@@ -195,6 +195,16 @@ final class WeaBotService: ObservableObject {
 
         registry.touchMessage(sessionKey: sessionKey)
 
+        if let command = message.command {
+            switch command {
+            case .done, .summarize:
+                Task {
+                    await bridge.injectSummarizationPrompt()
+                }
+                return
+            }
+        }
+
         Task {
             await bridge.injectMessage(message.text)
         }
