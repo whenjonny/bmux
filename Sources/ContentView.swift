@@ -11892,7 +11892,8 @@ private struct TabItemView: View, Equatable {
         if let groupId = tab.weaGroupId {
             Divider()
             Button(String(localized: "contextMenu.closeWeaChat", defaultValue: "Close WEA Chat")) {
-                WeaBotService.shared.removeBridge(for: "group:\(groupId)")
+                let sessionKey = WeaBotService.shared.sessionKeyForGroup(groupId)
+                WeaBotService.shared.removeBridge(for: sessionKey)
             }
         }
 

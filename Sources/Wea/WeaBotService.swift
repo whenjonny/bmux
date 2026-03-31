@@ -281,6 +281,48 @@ final class WeaBotService: ObservableObject {
         }
     }
 
+    // MARK: - Digest
+
+    /// Trigger knowledge digest for a workspace, then call completion.
+    func triggerDigest(forWorkspaceId workspaceId: String, completion: @escaping () -> Void) -> Bool {
+        guard let bridge = bridge(forWorkspaceId: workspaceId),
+              bridge.processAlive, bridge.replReady else {
+            return false
+        }
+        Task {
+            await bridge.injectSummarizationPrompt(onComplete: completion)
+        }
+        // 2-minute timeout
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000_000)
+            if bridge.state == .digesting {
+                self?.logger.warning("Digest timed out for workspace \(workspaceId)")
+                bridge.forceFinishDigest()
+                completion()
+            }
+        }
+        return true
+    }
+
+    /// Fallback: copy journal.md to summary.md when Claude is dead.
+    func fallbackDigest(for groupId: String) {
+        let folder = WeaBotConfig.shared.sessionFolder(for: groupId)
+        let journalPath = (folder as NSString).appendingPathComponent("journal.md")
+        let summaryPath = (folder as NSString).appendingPathComponent("summary.md")
+        guard FileManager.default.fileExists(atPath: journalPath),
+              !FileManager.default.fileExists(atPath: summaryPath) else { return }
+        try? FileManager.default.copyItem(atPath: journalPath, toPath: summaryPath)
+        logger.info("Fallback digest: copied journal.md to summary.md for \(groupId)")
+    }
+
+    /// Determine the correct session key prefix for a group ID.
+    func sessionKeyForGroup(_ groupId: String) -> String {
+        if let _ = registry.entry(for: "direct:\(groupId)") {
+            return "direct:\(groupId)"
+        }
+        return "group:\(groupId)"
+    }
+
     // MARK: - Hook Integration
 
     func handleClaudeStop(workspaceId: String, transcriptPath: String?, lastMessage: String?) {

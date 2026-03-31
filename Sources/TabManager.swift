@@ -2719,23 +2719,43 @@ class TabManager: ObservableObject {
 
     @discardableResult
     func closeWorkspaceWithConfirmation(_ workspace: Workspace) -> Bool {
-        // WEA workspace requires disconnect confirmation
-        if workspace.weaGroupId != nil {
-            guard confirmClose(
-                title: String(localized: "weaBot.closeChat.title", defaultValue: "Close WEA Chat?"),
-                message: String(
-                    localized: "weaBot.closeChat.message",
-                    defaultValue: "Closing this workspace will terminate the WEA chat session."
-                ),
-                acceptCmdD: tabs.count <= 1
-            ) else {
+        // WEA workspace requires digest/close confirmation
+        if let groupId = workspace.weaGroupId {
+            let alert = NSAlert()
+            alert.messageText = String(localized: "weaBot.closeChat.title", defaultValue: "Close WEA Chat?")
+            alert.informativeText = String(
+                localized: "weaBot.closeChat.digestMessage",
+                defaultValue: "Would you like to summarize this session and save learnings to the knowledge base before closing?"
+            )
+            alert.addButton(withTitle: String(localized: "weaBot.closeChat.digestAndClose", defaultValue: "Summarize & Close"))
+            alert.addButton(withTitle: String(localized: "weaBot.closeChat.closeOnly", defaultValue: "Close Without Summary"))
+            alert.addButton(withTitle: String(localized: "weaBot.closeChat.cancel", defaultValue: "Cancel"))
+
+            let response = alert.runModal()
+            switch response {
+            case .alertFirstButtonReturn:
+                let workspaceId = workspace.id.uuidString
+                let sessionKey = WeaBotService.shared.sessionKeyForGroup(groupId)
+                let started = WeaBotService.shared.triggerDigest(forWorkspaceId: workspaceId) { [weak self] in
+                    Task { @MainActor in
+                        WeaBotService.shared.removeBridge(for: sessionKey)
+                        self?.closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
+                    }
+                }
+                if !started {
+                    WeaBotService.shared.fallbackDigest(for: groupId)
+                    WeaBotService.shared.removeBridge(for: sessionKey)
+                    closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
+                }
+                return true
+            case .alertSecondButtonReturn:
+                let sessionKey = WeaBotService.shared.sessionKeyForGroup(groupId)
+                WeaBotService.shared.removeBridge(for: sessionKey)
+                closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
+                return true
+            default:
                 return false
             }
-            if let groupId = workspace.weaGroupId {
-                WeaBotService.shared.removeBridge(for: "group:\(groupId)")
-            }
-            closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
-            return true
         }
 
         if workspace.isPinned {
