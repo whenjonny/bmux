@@ -24,6 +24,19 @@ final class WeaBotService: ObservableObject {
     private var bridges: [String: WeaTerminalBridge] = [:]
     private var workspaceSessionKeys: [String: String] = [:]  // workspace UUID string -> sessionKey
 
+    // B1: Pre-service message queue — buffers messages arriving before .running state
+    private var preServiceQueue: [(payload: [String: Any], receivedAt: Date)] = []
+    private static let preServiceQueueMaxSize = 100
+    private static let preServiceMessageTTL: TimeInterval = 60
+
+    // B2: Dead bridge periodic cleanup timer
+    private var cleanupTimer: Timer?
+
+    // B3: Per-session rate limiting — sessionKey → recent message timestamps
+    private var messageTimestamps: [String: [Date]] = [:]
+    private static let rateLimitWindow: TimeInterval = 60
+    private static let rateLimitMaxMessages = 10
+
     weak var tabManager: TabManager?
 
     private init() {
@@ -38,6 +51,7 @@ final class WeaBotService: ObservableObject {
                 switch wsState {
                 case .connected:
                     self.state = .running
+                    self.flushPreServiceQueue()
                 case .connecting: self.state = .connecting
                 case .reconnecting: self.state = .reconnecting
                 case .disconnected:
@@ -65,13 +79,22 @@ final class WeaBotService: ObservableObject {
 
         httpClient = WeaHttpClient(appId: config.appId, appSecret: secret, botId: config.botId)
         state = .connecting
+        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.cleanupDeadBridges()
+            }
+        }
         webSocket.connect(appId: config.appId, appSecret: secret)
     }
 
     func stop() {
+        cleanupTimer?.invalidate()
+        cleanupTimer = nil
         webSocket.disconnect()
         bridges.removeAll()
         workspaceSessionKeys.removeAll()
+        messageTimestamps.removeAll()
+        preServiceQueue.removeAll()
         // Don't clear the file-based registry — it's useful for restart reconnection.
         // Don't close WeA workspaces — they persist across disconnect/reconnect and app restarts.
         httpClient = nil
@@ -112,6 +135,17 @@ final class WeaBotService: ObservableObject {
     private static let staleMessageThresholdMs: Int64 = 30_000
 
     private func handleInboundMessage(_ payload: [String: Any]) {
+        // B1: Queue messages arriving before service is fully running
+        if state != .running {
+            if preServiceQueue.count >= Self.preServiceQueueMaxSize {
+                preServiceQueue.removeFirst()
+                logger.warning("Pre-service queue overflow — dropped oldest message")
+            }
+            preServiceQueue.append((payload: payload, receivedAt: Date()))
+            weaLog("[queue.preService] count=\(preServiceQueue.count)")
+            return
+        }
+
         let config = WeaBotConfig.shared
         let message: WeaParsedMessage
         do {
@@ -166,6 +200,23 @@ final class WeaBotService: ObservableObject {
     }
 
     private func routeToSession(sessionKey: String, groupId: String, displayName: String, message: WeaParsedMessage) {
+        // B3: Per-session rate limiting
+        var timestamps = messageTimestamps[sessionKey, default: []]
+        let cutoff = Date().addingTimeInterval(-Self.rateLimitWindow)
+        timestamps.removeAll { $0 < cutoff }
+        if timestamps.count >= Self.rateLimitMaxMessages {
+            weaLog("[rateLimit.exceeded] sessionKey=\(sessionKey) count=\(timestamps.count)")
+            Task {
+                try? await httpClient?.sendReply(
+                    text: "Rate limited — please wait before sending more messages.",
+                    dest: WeaMessageParser.replyDest(for: message)
+                )
+            }
+            return
+        }
+        timestamps.append(Date())
+        messageTimestamps[sessionKey] = timestamps
+
         let bridge: WeaTerminalBridge
 
         if let existing = bridges[sessionKey] {
@@ -228,6 +279,149 @@ final class WeaBotService: ObservableObject {
         )
     }
 
+    // MARK: - Pre-Service Queue (B1)
+
+    private func flushPreServiceQueue() {
+        guard !preServiceQueue.isEmpty else { return }
+        debugLog("queue.flush count=\(preServiceQueue.count)")
+        let now = Date()
+        let validMessages = preServiceQueue.filter {
+            now.timeIntervalSince($0.receivedAt) <= Self.preServiceMessageTTL
+        }
+        let expiredCount = preServiceQueue.count - validMessages.count
+        if expiredCount > 0 {
+            logger.info("Pre-service queue: dropped \(expiredCount) expired messages")
+        }
+        preServiceQueue.removeAll()
+        for msg in validMessages {
+            // State is .running at this point, so handleInboundMessage won't re-queue
+            handleInboundMessage(msg.payload)
+        }
+    }
+
+    // MARK: - Dead Bridge Cleanup (B2)
+
+    private func cleanupDeadBridges() {
+        for (key, bridge) in bridges {
+            // Don't clean up bridges in .processing or .waitingInput state —
+            // they may still get hook callbacks.
+            guard !bridge.processAlive, bridge.state == .idle else { continue }
+            bridges.removeValue(forKey: key)
+            workspaceSessionKeys = workspaceSessionKeys.filter { $0.value != key }
+            messageTimestamps.removeValue(forKey: key)
+            registry.markDead(sessionKey: key)
+            debugLog("cleanup.bridge sessionKey=\(key) reason=processDeadIdle")
+        }
+    }
+
+    // MARK: - Digest
+
+    /// Workspaces kept alive while background digest runs. Prevents deallocation
+    /// so the terminal process stays alive until summarization finishes.
+    private var backgroundDigestWorkspaces: [String: Workspace] = [:]  // sessionKey → Workspace
+
+    /// Start a background digest for a WEA session. The workspace is detached from the
+    /// tab list (visual close) but the terminal process stays alive. When the digest
+    /// completes (or times out), the result is sent to WEA and the workspace is torn down.
+    func startBackgroundDigest(sessionKey: String, groupId: String, workspace: Workspace) {
+        guard let bridge = bridges[sessionKey], bridge.processAlive, bridge.replReady else {
+            // Claude not alive — fallback immediately
+            fallbackDigestAndNotify(for: groupId, sessionKey: sessionKey)
+            return
+        }
+
+        // Hold workspace reference to keep terminal process alive
+        backgroundDigestWorkspaces[sessionKey] = workspace
+        logger.info("Background digest started for \(sessionKey)")
+
+        Task {
+            await bridge.injectSummarizationPrompt { [weak self] in
+                Task { @MainActor in
+                    self?.finishBackgroundDigest(sessionKey: sessionKey)
+                }
+            }
+        }
+
+        // 2-minute timeout
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000_000)
+            guard let self, self.backgroundDigestWorkspaces[sessionKey] != nil else { return }
+            if bridge.state == .digesting {
+                self.logger.warning("Background digest timed out for \(sessionKey)")
+                bridge.forceFinishDigest()
+                self.fallbackDigestAndNotify(for: groupId, sessionKey: sessionKey)
+                self.finishBackgroundDigest(sessionKey: sessionKey)
+            }
+        }
+    }
+
+    /// Clean up after background digest: tear down the held workspace, remove bridge.
+    private func finishBackgroundDigest(sessionKey: String) {
+        if let workspace = backgroundDigestWorkspaces.removeValue(forKey: sessionKey) {
+            workspace.teardownAllPanels()
+            workspace.teardownRemoteConnection()
+            workspace.owningTabManager = nil
+            logger.info("Background digest workspace torn down for \(sessionKey)")
+        }
+        removeBridge(for: sessionKey)
+    }
+
+    /// Trigger knowledge digest for a workspace (non-closing), then call completion.
+    func triggerDigest(forWorkspaceId workspaceId: String, completion: @escaping () -> Void) -> Bool {
+        guard let bridge = bridge(forWorkspaceId: workspaceId),
+              bridge.processAlive, bridge.replReady else {
+            return false
+        }
+        Task {
+            await bridge.injectSummarizationPrompt(onComplete: completion)
+        }
+        // 2-minute timeout
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000_000)
+            if bridge.state == .digesting {
+                self?.logger.warning("Digest timed out for workspace \(workspaceId)")
+                bridge.forceFinishDigest()
+                completion()
+            }
+        }
+        return true
+    }
+
+    /// Fallback: copy journal.md to summary.md and notify WEA that auto-summarization was skipped.
+    private func fallbackDigestAndNotify(for groupId: String, sessionKey: String) {
+        let folder = WeaBotConfig.shared.sessionFolder(for: groupId)
+        let journalPath = (folder as NSString).appendingPathComponent("journal.md")
+        let summaryPath = (folder as NSString).appendingPathComponent("summary.md")
+        if FileManager.default.fileExists(atPath: journalPath),
+           !FileManager.default.fileExists(atPath: summaryPath) {
+            try? FileManager.default.copyItem(atPath: journalPath, toPath: summaryPath)
+        }
+        logger.info("Fallback digest for \(groupId)")
+
+        // Notify WEA
+        if let bridge = bridges[sessionKey], let httpClient {
+            Task {
+                try? await httpClient.sendText(
+                    body: "[\u{1F4CB} Session closed — auto-summarization skipped (Claude not available). Journal saved.]",
+                    dest: bridge.dest
+                )
+            }
+        }
+    }
+
+    /// Fallback: copy journal.md to summary.md when Claude is dead (public, for external callers).
+    func fallbackDigest(for groupId: String) {
+        let sessionKey = sessionKeyForGroup(groupId)
+        fallbackDigestAndNotify(for: groupId, sessionKey: sessionKey)
+    }
+
+    /// Determine the correct session key prefix for a group ID.
+    func sessionKeyForGroup(_ groupId: String) -> String {
+        if let _ = registry.entry(for: "direct:\(groupId)") {
+            return "direct:\(groupId)"
+        }
+        return "group:\(groupId)"
+    }
     // MARK: - Hook Integration
 
     func handleClaudeStop(workspaceId: String, transcriptPath: String?, lastMessage: String?) {
