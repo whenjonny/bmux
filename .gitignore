@@ -47,3 +47,13 @@ tests/visual_report.html
 # Local scratch (screenshots, etc.)
 tmp/
 tmp-*/
+
+# Local temp artifacts
+TemporaryDirectory.*/
+_Users_user*.lock
+_tmp_cmux-*.lock
+_private_tmp_cmux-*.lock
+
+# Local generated outputs
+builds/
+swift-generated-sources/
