@@ -14,6 +14,11 @@ final class WeaSessionRegistry {
         var panelId: String
         var alive: Bool
         var lastMessageAt: Date
+        var claudeSessionId: String?
+        var chatType: String?           // "direct" or "group"
+        var lastSummaryAt: Date?
+        var destGroupId: String?        // for GROUP dest reconstruction
+        var destWuid: String?           // for USER dest reconstruction
     }
 
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaSessionRegistry")
@@ -31,7 +36,7 @@ final class WeaSessionRegistry {
 
     // MARK: - Public API
 
-    func register(sessionKey: String, groupId: String, displayName: String, workspaceId: UUID, panelId: UUID) {
+    func register(sessionKey: String, groupId: String, displayName: String, workspaceId: UUID, panelId: UUID, chatType: String? = nil, destGroupId: String? = nil, destWuid: String? = nil) {
         entries[sessionKey] = Entry(
             sessionKey: sessionKey,
             groupId: groupId,
@@ -39,7 +44,12 @@ final class WeaSessionRegistry {
             workspaceId: workspaceId.uuidString,
             panelId: panelId.uuidString,
             alive: true,
-            lastMessageAt: Date()
+            lastMessageAt: Date(),
+            claudeSessionId: nil,
+            chatType: chatType,
+            lastSummaryAt: nil,
+            destGroupId: destGroupId,
+            destWuid: destWuid
         )
         save()
     }
@@ -64,8 +74,27 @@ final class WeaSessionRegistry {
         save()
     }
 
+    func updateClaudeSessionId(_ sessionId: String, for sessionKey: String) {
+        guard var entry = entries[sessionKey] else { return }
+        entry.claudeSessionId = sessionId
+        entries[sessionKey] = entry
+        save()
+    }
+
+    func updateLastSummary(for sessionKey: String) {
+        guard var entry = entries[sessionKey] else { return }
+        entry.lastSummaryAt = Date()
+        entries[sessionKey] = entry
+        save()
+    }
+
     func entry(for sessionKey: String) -> Entry? {
         entries[sessionKey]
+    }
+
+    /// Returns all entries with `alive == true` and `lastMessageAt` after the given date.
+    func activeEntries(since cutoff: Date) -> [Entry] {
+        entries.values.filter { $0.alive && $0.lastMessageAt >= cutoff }
     }
 
     func removeAll() {
