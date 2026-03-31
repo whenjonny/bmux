@@ -376,11 +376,13 @@ final class WeaHttpClient {
             query: query
         )
 
-        var components = URLComponents(string: "\(baseURL)\(path)")!
-        components.queryItems = query
-            .map { URLQueryItem(name: $0.key, value: $0.value) }
-            .sorted { $0.name < $1.name }
-        guard let url = components.url else { throw WeaError.notConnected }
+        let encodedQuery = query
+            .sorted { $0.key < $1.key }
+            .map { "\(percentEncodeQueryComponent($0.key))=\(percentEncodeQueryComponent($0.value))" }
+            .joined(separator: "&")
+        guard let url = URL(string: "\(baseURL)\(path)?\(encodedQuery)") else {
+            throw WeaError.notConnected
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -399,6 +401,13 @@ final class WeaHttpClient {
             }
         }
         return try JSONSerialization.jsonObject(with: data)
+    }
+
+    private func percentEncodeQueryComponent(_ value: String) -> String {
+        // RFC 3986 unreserved chars only, so "+" is encoded as "%2B".
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
 
     /// Split text at paragraph/line/word boundaries.

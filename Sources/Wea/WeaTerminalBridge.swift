@@ -53,6 +53,7 @@ final class WeaTerminalBridge {
 
     // A2: Hook timeout fallback watchdog
     private var processingWatchdog: Task<Void, Never>?
+    private var queuedSubmitSafeguardTask: Task<Void, Never>?
 
 
     /// Set by WeaBotService when a WEA message is being injected.
@@ -103,6 +104,7 @@ final class WeaTerminalBridge {
         startupTimeoutTask?.cancel()
         streamingTimer?.cancel()
         processingWatchdog?.cancel()
+        queuedSubmitSafeguardTask?.cancel()
         try? FileManager.default.removeItem(atPath: weaActiveMarkerPath)
         try? FileManager.default.removeItem(atPath: agentAlivePath)
     }
@@ -156,13 +158,13 @@ final class WeaTerminalBridge {
         guard state != .processing, state != .waitingInput else { return }
         if let first = pendingMessages.first {
             pendingMessages.removeFirst()
-            Task { await injectMessage(first) }
+            Task { await injectMessage(first, fromStartupQueue: true) }
         }
     }
 
     // MARK: - Inject WEA message into terminal
 
-    func injectMessage(_ text: String) async {
+    func injectMessage(_ text: String, fromStartupQueue: Bool = false) async {
         // Queue only during startup — REPL not ready yet.
         if !replReady {
             weaLog("\(lp) REPL not ready, queueing: \(text.prefix(50))")
@@ -193,6 +195,7 @@ final class WeaTerminalBridge {
 
         // Always forward to terminal immediately — no queueing after startup.
         panel.sendInput(text + "\n")
+        scheduleQueuedSubmitSafeguardIfNeeded(forStartupQueuedMessage: fromStartupQueue)
 
         // Enter processing state on first message; subsequent messages just stack.
         if state != .processing {
@@ -219,6 +222,8 @@ final class WeaTerminalBridge {
 
     /// Called when Stop hook fires — Claude finished responding.
     func onClaudeStop(transcriptPath: String?, lastMessage: String?) async {
+        queuedSubmitSafeguardTask?.cancel()
+        queuedSubmitSafeguardTask = nil
         processingWatchdog?.cancel()
         processingWatchdog = nil
 
@@ -297,6 +302,8 @@ final class WeaTerminalBridge {
     /// Called when Claude needs user input (Notification hook).
     /// Refreshes the current thinking card to show the question.
     func onNeedsInput(question: String) async {
+        queuedSubmitSafeguardTask?.cancel()
+        queuedSubmitSafeguardTask = nil
         processingWatchdog?.cancel()
         processingWatchdog = nil
         state = .waitingInput
@@ -306,6 +313,8 @@ final class WeaTerminalBridge {
     /// Called when PreToolUse fires AskUserQuestion.
     /// Refreshes the current thinking card to show the question.
     func onAskUserQuestion(questionText: String) async {
+        queuedSubmitSafeguardTask?.cancel()
+        queuedSubmitSafeguardTask = nil
         processingWatchdog?.cancel()
         processingWatchdog = nil
         state = .waitingInput
@@ -369,6 +378,8 @@ final class WeaTerminalBridge {
         streamingTimer = nil
         processingWatchdog?.cancel()
         processingWatchdog = nil
+        queuedSubmitSafeguardTask?.cancel()
+        queuedSubmitSafeguardTask = nil
         // Clean up orphaned thinking cards
         let orphanedCards = thinkingCardIds
         if !orphanedCards.isEmpty {
@@ -418,8 +429,37 @@ final class WeaTerminalBridge {
         if let next = pendingMessages.first {
             pendingMessages.removeFirst()
             Task {
-                await injectMessage(next)
+                await injectMessage(next, fromStartupQueue: true)
             }
+        }
+    }
+
+    private func scheduleQueuedSubmitSafeguardIfNeeded(forStartupQueuedMessage: Bool) {
+        guard forStartupQueuedMessage else { return }
+        queuedSubmitSafeguardTask?.cancel()
+
+        let baselineUserCount: Int? = {
+            guard let path = transcriptPath, !path.isEmpty else { return nil }
+            return readTranscriptUserMessageCount(from: path)
+        }()
+
+        queuedSubmitSafeguardTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled else { return }
+            guard self.state == .processing, self.pendingReplyCount > 0 else { return }
+
+            if let baselineUserCount,
+               let path = self.transcriptPath,
+               !path.isEmpty {
+                let currentUserCount = self.readTranscriptUserMessageCount(from: path)
+                if currentUserCount > baselineUserCount {
+                    return
+                }
+            }
+
+            weaLog("\(self.lp) Queued prompt submit safeguard: replaying Return")
+            self.panel.sendInput("\n")
         }
     }
 
@@ -600,6 +640,24 @@ final class WeaTerminalBridge {
             }
         }
         return lastContent
+    }
+
+    private func readTranscriptUserMessageCount(from path: String) -> Int {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let content = String(data: data, encoding: .utf8) else { return 0 }
+
+        var count = 0
+        for line in content.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let lineData = trimmed.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let message = obj["message"] as? [String: Any],
+                  let role = message["role"] as? String,
+                  role == "user" else { continue }
+            count += 1
+        }
+        return count
     }
 
     // MARK: - Marker file for hook discrimination
