@@ -23,6 +23,7 @@ final class WeaTerminalBridge {
         case idle
         case processing       // Claude is working on a WEA message
         case waitingInput     // Claude is asking a question
+        case digesting        // Running knowledge digest
     }
 
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaTerminalBridge")
@@ -41,14 +42,15 @@ final class WeaTerminalBridge {
     /// Number of messages injected that haven't received a Stop reply yet.
     private var pendingReplyCount = 0
     private var pendingMessages: [String] = []
-    private var replReady = false
+    private(set) var replReady = false
     private var startupTimeoutTask: Task<Void, Never>?
+    private var digestCompletionHandler: (() -> Void)?
     private let startupTimeoutSeconds: UInt64 = 30
 
 
     /// Set by WeaBotService when a WEA message is being injected.
     /// Claude Code hooks check this to know if the current prompt is from WEA.
-    var isWeaMessageActive: Bool { state == .processing || state == .waitingInput }
+    var isWeaMessageActive: Bool { state == .processing || state == .waitingInput || state == .digesting }
 
     /// Flag file used by hooks to detect WEA-originated prompts.
     nonisolated let weaActiveMarkerPath: String
@@ -171,11 +173,45 @@ final class WeaTerminalBridge {
         }
     }
 
+    // MARK: - Digest (Summarization)
+
+    func injectSummarizationPrompt(onComplete: (() -> Void)? = nil) async {
+        digestCompletionHandler = onComplete
+
+        guard replReady, processAlive else {
+            weaLog("[Bridge:\(sessionKey)] Cannot digest: replReady=\(replReady) processAlive=\(processAlive)")
+            onComplete?()
+            digestCompletionHandler = nil
+            return
+        }
+
+        state = .digesting
+        writeMarker()
+
+        let prompt = "/wea-session-digest"
+        weaLog("[Bridge:\(sessionKey)] Injecting digest prompt")
+        panel.sendInput(prompt + "\n")
+
+        do {
+            let cardId = try await httpClient.sendCard(content: "\u{1F4DD} summarizing session...", dest: dest)
+            thinkingCardIds.append(cardId)
+        } catch {
+            weaLog("[Bridge:\(sessionKey)] Failed to send digest thinking card: \(error.localizedDescription)")
+        }
+    }
+
+    func forceFinishDigest() {
+        guard state == .digesting else { return }
+        weaLog("[Bridge:\(sessionKey)] Digest force-finished (timeout)")
+        digestCompletionHandler = nil
+        finishProcessing()
+    }
+
     // MARK: - Hook Callbacks (called by WeaBotService)
 
     /// Called when Stop hook fires — Claude finished responding.
     func onClaudeStop(transcriptPath: String?, lastMessage: String?) async {
-        guard state == .processing || state == .waitingInput else { return }
+        guard state == .processing || state == .waitingInput || state == .digesting else { return }
 
         pendingReplyCount = max(0, pendingReplyCount - 1)
 
@@ -227,6 +263,15 @@ final class WeaTerminalBridge {
             } catch {
                 weaLog("[Bridge:\(sessionKey)] Failed to send image \(i + 1): \(error.localizedDescription)")
             }
+        }
+
+        if state == .digesting {
+            weaLog("[Bridge:\(sessionKey)] Digest completed")
+            let handler = digestCompletionHandler
+            digestCompletionHandler = nil
+            finishProcessing()
+            handler?()
+            return
         }
 
         // Only go idle when all injected messages have been replied to.
