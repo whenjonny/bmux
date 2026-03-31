@@ -2,6 +2,18 @@
 import Foundation
 import os
 
+private func weaLog(_ message: String) {
+    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+    let path = "/tmp/cmux-wea-debug.log"
+    if let handle = FileHandle(forWritingAtPath: path) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        try? handle.close()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+    }
+}
+
 @MainActor
 final class WeaBotService: ObservableObject {
     static let shared = WeaBotService()
@@ -60,8 +72,10 @@ final class WeaBotService: ObservableObject {
 
         if let tabManager {
             workspaceManager = WeaWorkspaceManager(tabManager: tabManager)
-            reconnectRestoredWorkspaces(tabManager: tabManager)
-            proactiveRestore()
+            // Clean slate on restart — close any WEA workspaces restored from the session snapshot.
+            // Reconnecting restored terminals is unreliable (surface init races), so we start fresh.
+            // The registry is kept so we can --resume Claude sessions when messages arrive.
+            workspaceManager?.closeAllWeaWorkspaces()
         }
 
         httpClient = WeaHttpClient(appId: config.appId, appSecret: secret, botId: config.botId)
@@ -78,33 +92,6 @@ final class WeaBotService: ObservableObject {
         httpClient = nil
         workspaceManager = nil
         state = .stopped
-    }
-
-    // MARK: - Restored Workspace Reconnection
-
-    /// Pre-populate workspace→sessionKey mappings for WeA workspaces that were restored
-    /// from the session snapshot. Bridges are created lazily when the first message arrives.
-    private func reconnectRestoredWorkspaces(tabManager: TabManager) {
-        for workspace in tabManager.tabs {
-            guard let groupId = workspace.weaGroupId else { continue }
-            let sessionKey = sessionKey(for: groupId)
-            workspaceSessionKeys[workspace.id.uuidString.lowercased()] = sessionKey
-            logger.info("Reconnected restored WEA workspace '\(workspace.title)' for \(groupId)")
-        }
-    }
-
-    /// Derive a session key from a group ID. Group messages use "group:{id}",
-    /// DM sessions use "direct:{wuid}". For restored workspaces where we don't
-    /// know the chat type, we inspect the groupId format to determine the key.
-    private func sessionKey(for groupId: String) -> String {
-        // The groupId stored on the workspace is the raw group/wuid value.
-        // During routeDirectMessage we use "direct:{wuid}" and in routeGroupMessage "group:{groupId}".
-        // For restored workspaces, check if the registry has an entry to determine the prefix.
-        // Fall back to "group:" since that's the most common case.
-        if let entry = registry.entry(for: "direct:\(groupId)") {
-            return "direct:\(entry.groupId)"
-        }
-        return "group:\(groupId)"
     }
 
     // MARK: - Message Routing
@@ -162,29 +149,25 @@ final class WeaBotService: ObservableObject {
     private func routeToSession(sessionKey: String, groupId: String, displayName: String, message: WeaParsedMessage) {
         let bridge: WeaTerminalBridge
 
-        if let existing = bridges[sessionKey] {
-            let panelLive = workspaceManager?.hasLiveTerminalPanel(groupId: groupId, panelId: existing.panelId) == true
-            if panelLive && existing.processAlive {
-                bridge = existing
-            } else if panelLive && !existing.processAlive {
-                // Panel exists but Claude died — restart Claude in the same terminal.
-                logger.info("Restarting Claude in existing panel for \(sessionKey)")
-                existing.restartClaude(command: workspaceManager?.launchCommand(for: groupId) ?? "")
+        if let existing = bridges[sessionKey], backgroundDigestWorkspaces[sessionKey] == nil {
+            weaLog("[Route] \(sessionKey): processAlive=\(existing.processAlive) replReady=\(existing.replReady)")
+
+            if existing.processAlive {
+                // Claude running — use as-is.
                 bridge = existing
             } else {
-                // Panel gone — recreate everything.
-                logger.info("Recreating bridge for \(sessionKey): panelLive=\(panelLive) processAlive=\(existing.processAlive)")
-                bridges.removeValue(forKey: sessionKey)
-                registry.markDead(sessionKey: sessionKey)
-                if let newBridge = createBridge(sessionKey: sessionKey, groupId: groupId, displayName: displayName, message: message) {
-                    bridge = newBridge
-                    bridges[sessionKey] = bridge
-                } else {
-                    logger.error("Failed to recreate bridge for session \(sessionKey)")
-                    return
-                }
+                // Claude died — restart with --resume or --continue.
+                let resumeId = existing.claudeSessionId
+                    ?? registry.entry(for: sessionKey)?.claudeSessionId
+                logger.info("Restarting Claude for \(sessionKey), resumeId=\(resumeId ?? "nil")")
+                existing.restartClaude(command: workspaceManager?.launchCommand(for: groupId, claudeSessionId: resumeId, continueLastSession: resumeId == nil) ?? "")
+                bridge = existing
             }
         } else {
+            // No active bridge, or old bridge is in background digest — create fresh.
+            if backgroundDigestWorkspaces[sessionKey] != nil {
+                logger.info("Session \(sessionKey) in background digest — creating new session")
+            }
             guard let newBridge = createBridge(sessionKey: sessionKey, groupId: groupId, displayName: displayName, message: message) else {
                 logger.error("Failed to create bridge for session \(sessionKey)")
                 return
@@ -210,14 +193,16 @@ final class WeaBotService: ObservableObject {
         }
     }
 
-    private func createBridge(sessionKey: String, groupId: String, displayName: String, message: WeaParsedMessage) -> WeaTerminalBridge? {
+    private func createBridge(sessionKey: String, groupId: String, displayName: String, message: WeaParsedMessage, claudeSessionId: String? = nil) -> WeaTerminalBridge? {
         guard let httpClient, let workspaceManager else { return nil }
         let dest = WeaMessageParser.replyDest(for: message)
 
-        // Check if the workspace was restored from a previous session and has a saved Claude session ID.
-        let claudeSessionId = workspaceManager.workspace(for: groupId)?.claudeSessionId
+        // Use provided session ID, check registry, or fall back to workspace.
+        let resumeId = claudeSessionId
+            ?? registry.entry(for: sessionKey)?.claudeSessionId
+            ?? workspaceManager.workspace(for: groupId)?.claudeSessionId
 
-        guard let panel = workspaceManager.findOrCreatePanel(groupId: groupId, displayName: displayName, claudeSessionId: claudeSessionId) else {
+        guard let panel = workspaceManager.findOrCreatePanel(groupId: groupId, displayName: displayName, claudeSessionId: resumeId) else {
             return nil
         }
 
@@ -243,47 +228,59 @@ final class WeaBotService: ObservableObject {
         )
     }
 
-    // MARK: - Proactive Restore
-
-    private func reconstructDest(from entry: WeaSessionRegistry.Entry) -> WeaMessageDest {
-        if let groupId = entry.destGroupId {
-            return .group(groupId)
-        }
-        if let wuid = entry.destWuid {
-            return .dm(to: wuid)
-        }
-        if entry.sessionKey.hasPrefix("direct:") {
-            return .dm(to: entry.groupId)
-        }
-        return .group(entry.groupId)
-    }
-
-    private func proactiveRestore() {
-        guard let httpClient, let workspaceManager else { return }
-        let cutoff = Date().addingTimeInterval(-24 * 3600)
-        let recentEntries = registry.activeEntries(since: cutoff)
-
-        for entry in recentEntries {
-            guard bridges[entry.sessionKey] == nil else { continue }
-            guard let workspace = workspaceManager.workspace(for: entry.groupId) else { continue }
-            guard let panel = workspace.panels.values.compactMap({ $0 as? TerminalPanel }).first else { continue }
-
-            let dest = reconstructDest(from: entry)
-            let bridge = WeaTerminalBridge(
-                sessionKey: entry.sessionKey,
-                panel: panel,
-                httpClient: httpClient,
-                dest: dest
-            )
-            bridges[entry.sessionKey] = bridge
-            workspaceSessionKeys[workspace.id.uuidString.lowercased()] = entry.sessionKey
-            logger.info("Proactively restored bridge for \(entry.sessionKey) (last active: \(entry.lastMessageAt))")
-        }
-    }
-
     // MARK: - Digest
 
-    /// Trigger knowledge digest for a workspace, then call completion.
+    /// Workspaces kept alive while background digest runs. Prevents deallocation
+    /// so the terminal process stays alive until summarization finishes.
+    private var backgroundDigestWorkspaces: [String: Workspace] = [:]  // sessionKey → Workspace
+
+    /// Start a background digest for a WEA session. The workspace is detached from the
+    /// tab list (visual close) but the terminal process stays alive. When the digest
+    /// completes (or times out), the result is sent to WEA and the workspace is torn down.
+    func startBackgroundDigest(sessionKey: String, groupId: String, workspace: Workspace) {
+        guard let bridge = bridges[sessionKey], bridge.processAlive, bridge.replReady else {
+            // Claude not alive — fallback immediately
+            fallbackDigestAndNotify(for: groupId, sessionKey: sessionKey)
+            return
+        }
+
+        // Hold workspace reference to keep terminal process alive
+        backgroundDigestWorkspaces[sessionKey] = workspace
+        logger.info("Background digest started for \(sessionKey)")
+
+        Task {
+            await bridge.injectSummarizationPrompt { [weak self] in
+                Task { @MainActor in
+                    self?.finishBackgroundDigest(sessionKey: sessionKey)
+                }
+            }
+        }
+
+        // 2-minute timeout
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000_000)
+            guard let self, self.backgroundDigestWorkspaces[sessionKey] != nil else { return }
+            if bridge.state == .digesting {
+                self.logger.warning("Background digest timed out for \(sessionKey)")
+                bridge.forceFinishDigest()
+                self.fallbackDigestAndNotify(for: groupId, sessionKey: sessionKey)
+                self.finishBackgroundDigest(sessionKey: sessionKey)
+            }
+        }
+    }
+
+    /// Clean up after background digest: tear down the held workspace, remove bridge.
+    private func finishBackgroundDigest(sessionKey: String) {
+        if let workspace = backgroundDigestWorkspaces.removeValue(forKey: sessionKey) {
+            workspace.teardownAllPanels()
+            workspace.teardownRemoteConnection()
+            workspace.owningTabManager = nil
+            logger.info("Background digest workspace torn down for \(sessionKey)")
+        }
+        removeBridge(for: sessionKey)
+    }
+
+    /// Trigger knowledge digest for a workspace (non-closing), then call completion.
     func triggerDigest(forWorkspaceId workspaceId: String, completion: @escaping () -> Void) -> Bool {
         guard let bridge = bridge(forWorkspaceId: workspaceId),
               bridge.processAlive, bridge.replReady else {
@@ -304,15 +301,32 @@ final class WeaBotService: ObservableObject {
         return true
     }
 
-    /// Fallback: copy journal.md to summary.md when Claude is dead.
-    func fallbackDigest(for groupId: String) {
+    /// Fallback: copy journal.md to summary.md and notify WEA that auto-summarization was skipped.
+    private func fallbackDigestAndNotify(for groupId: String, sessionKey: String) {
         let folder = WeaBotConfig.shared.sessionFolder(for: groupId)
         let journalPath = (folder as NSString).appendingPathComponent("journal.md")
         let summaryPath = (folder as NSString).appendingPathComponent("summary.md")
-        guard FileManager.default.fileExists(atPath: journalPath),
-              !FileManager.default.fileExists(atPath: summaryPath) else { return }
-        try? FileManager.default.copyItem(atPath: journalPath, toPath: summaryPath)
-        logger.info("Fallback digest: copied journal.md to summary.md for \(groupId)")
+        if FileManager.default.fileExists(atPath: journalPath),
+           !FileManager.default.fileExists(atPath: summaryPath) {
+            try? FileManager.default.copyItem(atPath: journalPath, toPath: summaryPath)
+        }
+        logger.info("Fallback digest for \(groupId)")
+
+        // Notify WEA
+        if let bridge = bridges[sessionKey], let httpClient {
+            Task {
+                try? await httpClient.sendText(
+                    body: "[\u{1F4CB} Session closed — auto-summarization skipped (Claude not available). Journal saved.]",
+                    dest: bridge.dest
+                )
+            }
+        }
+    }
+
+    /// Fallback: copy journal.md to summary.md when Claude is dead (public, for external callers).
+    func fallbackDigest(for groupId: String) {
+        let sessionKey = sessionKeyForGroup(groupId)
+        fallbackDigestAndNotify(for: groupId, sessionKey: sessionKey)
     }
 
     /// Determine the correct session key prefix for a group ID.
@@ -359,21 +373,27 @@ final class WeaBotService: ObservableObject {
     }
 
     func handleSessionStart(workspaceId: String, transcriptPath: String?, sessionId: String? = nil) {
+        logger.info("handleSessionStart: workspaceId=\(workspaceId), sessionId=\(sessionId ?? "nil"), bridges=\(self.bridges.count), wsKeys=\(self.workspaceSessionKeys.keys.joined(separator: ","))")
         if let bridge = bridge(forWorkspaceId: workspaceId) {
+            logger.info("handleSessionStart: matched bridge \(bridge.sessionKey)")
             bridge.startTranscriptWatch(path: transcriptPath, sessionId: sessionId)
             storeClaudeSessionId(sessionId, forWorkspaceId: workspaceId)
             if let sessionId, !sessionId.isEmpty {
                 registry.updateClaudeSessionId(sessionId, for: bridge.sessionKey)
+                logger.info("handleSessionStart: saved sessionId=\(sessionId) for \(bridge.sessionKey)")
             }
             return
         }
         for bridge in bridges.values where bridge.isWeaMessageActive {
+            logger.info("handleSessionStart: fallback matched active bridge \(bridge.sessionKey)")
             bridge.startTranscriptWatch(path: transcriptPath, sessionId: sessionId)
             if let sessionId, !sessionId.isEmpty {
                 registry.updateClaudeSessionId(sessionId, for: bridge.sessionKey)
+                logger.info("handleSessionStart: saved sessionId=\(sessionId) for \(bridge.sessionKey) (fallback)")
             }
             return
         }
+        logger.warning("handleSessionStart: no matching bridge found for workspaceId=\(workspaceId)")
     }
 
     private func storeClaudeSessionId(_ sessionId: String?, forWorkspaceId workspaceId: String) {

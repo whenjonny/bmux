@@ -110,9 +110,11 @@ final class WeaTerminalBridge {
         }
 
         // Keep pending messages so a late SessionStart can still flush and reply.
-        // We only notify the user about startup delay/failure here.
+        // Reset all tracking state so counts don't carry over into the next attempt.
         state = .idle
         activeCardId = nil
+        thinkingCardIds.removeAll()
+        pendingReplyCount = 0
         cleanupMarker()
     }
 
@@ -127,7 +129,11 @@ final class WeaTerminalBridge {
         guard state != .processing, state != .waitingInput else { return }
         if let first = pendingMessages.first {
             pendingMessages.removeFirst()
-            Task { await injectMessage(first) }
+            Task {
+                // Small delay to let Claude's prompt render after startup.
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                await injectMessage(first)
+            }
         }
     }
 
@@ -138,6 +144,21 @@ final class WeaTerminalBridge {
         if !replReady {
             weaLog("[Bridge:\(sessionKey)] REPL not ready, queueing: \(text.prefix(50))")
             pendingMessages.append(text)
+            // Send thinking card immediately so WEA user sees feedback while Claude starts.
+            // Don't increment pendingReplyCount here — the re-injection via markReady will
+            // call injectMessage again which handles the count.
+            if thinkingCardIds.isEmpty {
+                do {
+                    let cardId = try await httpClient.sendCard(
+                        content: "⏳ starting up...",
+                        dest: dest
+                    )
+                    thinkingCardIds.append(cardId)
+                    weaLog("[Bridge:\(sessionKey)] Sent startup thinking card, id=\(cardId)")
+                } catch {
+                    weaLog("[Bridge:\(sessionKey)] Failed to send startup thinking card: \(error.localizedDescription)")
+                }
+            }
             return
         }
 
@@ -158,18 +179,23 @@ final class WeaTerminalBridge {
         panel.sendInput(text + "\n")
 
         // Every injected message gets its own thinking card in the FIFO queue.
+        // Skip if there's already a pending card (e.g., the "starting up..." card from startup).
         state = .processing
         writeMarker()
 
-        do {
-            let cardId = try await httpClient.sendCard(
-                content: "⏳ thinking...",
-                dest: dest
-            )
-            thinkingCardIds.append(cardId)
-            weaLog("[Bridge:\(sessionKey)] Sent thinking card, id=\(cardId)")
-        } catch {
-            weaLog("[Bridge:\(sessionKey)] Failed to send thinking card: \(error.localizedDescription)")
+        if thinkingCardIds.isEmpty {
+            do {
+                let cardId = try await httpClient.sendCard(
+                    content: "⏳ thinking...",
+                    dest: dest
+                )
+                thinkingCardIds.append(cardId)
+                weaLog("[Bridge:\(sessionKey)] Sent thinking card, id=\(cardId)")
+            } catch {
+                weaLog("[Bridge:\(sessionKey)] Failed to send thinking card: \(error.localizedDescription)")
+            }
+        } else {
+            weaLog("[Bridge:\(sessionKey)] Reusing existing card (count=\(thinkingCardIds.count))")
         }
     }
 
@@ -370,10 +396,12 @@ final class WeaTerminalBridge {
         pendingReplyCount = 0
         cleanupMarker()
 
-        // Process next queued message (from startup queue)
+        // Process next queued message (from startup queue).
+        // Small delay to let Claude's prompt render before injecting.
         if let next = pendingMessages.first {
             pendingMessages.removeFirst()
             Task {
+                try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
                 await injectMessage(next)
             }
         }

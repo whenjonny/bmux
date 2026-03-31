@@ -11176,6 +11176,9 @@ struct CMUXCLI {
             if let tp = parsedInput.transcriptPath, !tp.isEmpty {
                 weaSessionStartPayload["transcript_path"] = tp
             }
+            if let sid = parsedInput.sessionId, !sid.isEmpty {
+                weaSessionStartPayload["session_id"] = sid
+            }
             sendWeaHookCommand("wea_session_start", payload: weaSessionStartPayload, client: client)
             print("OK")
 
@@ -11841,6 +11844,12 @@ struct CMUXCLI {
         if let context = object["context"] as? [String: Any],
            let id = firstString(in: context, keys: ["session_id", "sessionId"]) {
             return id
+        }
+        // Fallback: Claude Code exposes the session ID as CLAUDE_SESSION_ID env var
+        // in the hook subprocess environment.
+        if let envId = ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"],
+           !envId.isEmpty {
+            return envId
         }
         return nil
     }

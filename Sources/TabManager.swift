@@ -2719,7 +2719,8 @@ class TabManager: ObservableObject {
 
     @discardableResult
     func closeWorkspaceWithConfirmation(_ workspace: Workspace) -> Bool {
-        // WEA workspace requires digest/close confirmation
+        // WEA workspace: ask whether to summarize before closing.
+        // "Summarize & Close" runs digest in background (non-blocking).
         if let groupId = workspace.weaGroupId {
             let alert = NSAlert()
             alert.messageText = String(localized: "weaBot.closeChat.title", defaultValue: "Close WEA Chat?")
@@ -2734,24 +2735,15 @@ class TabManager: ObservableObject {
             let response = alert.runModal()
             switch response {
             case .alertFirstButtonReturn:
-                let workspaceId = workspace.id.uuidString
+                // Summarize & Close: close tab immediately, digest runs in background,
+                // result sent to WEA as notification.
                 let sessionKey = WeaBotService.shared.sessionKeyForGroup(groupId)
-                let started = WeaBotService.shared.triggerDigest(forWorkspaceId: workspaceId) { [weak self] in
-                    Task { @MainActor in
-                        WeaBotService.shared.removeBridge(for: sessionKey)
-                        self?.closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
-                    }
-                }
-                if !started {
-                    WeaBotService.shared.fallbackDigest(for: groupId)
-                    WeaBotService.shared.removeBridge(for: sessionKey)
-                    closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
-                }
+                closeWeaWorkspace(workspace, sessionKey: sessionKey, groupId: groupId, runDigest: true)
                 return true
             case .alertSecondButtonReturn:
+                // Close without summary
                 let sessionKey = WeaBotService.shared.sessionKeyForGroup(groupId)
-                WeaBotService.shared.removeBridge(for: sessionKey)
-                closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
+                closeWeaWorkspace(workspace, sessionKey: sessionKey, groupId: groupId, runDigest: false)
                 return true
             default:
                 return false
@@ -2774,6 +2766,45 @@ class TabManager: ObservableObject {
         }
         closeWorkspaceIfRunningProcess(workspace)
         return true
+    }
+
+    /// Close a WEA workspace. If `runDigest` is true, the terminal stays alive
+    /// in the background for summarization; result is sent to WEA when done.
+    private func closeWeaWorkspace(_ workspace: Workspace, sessionKey: String, groupId: String, runDigest: Bool) {
+        if runDigest {
+            // Detach from tab list but keep panels alive for background digest
+            if tabs.count <= 1 {
+                WeaBotService.shared.startBackgroundDigest(
+                    sessionKey: sessionKey, groupId: groupId, workspace: workspace
+                )
+                if let window {
+                    window.performClose(nil)
+                } else {
+                    AppDelegate.shared?.closeMainWindowContainingTabId(workspace.id)
+                }
+                return
+            }
+
+            sidebarSelectedWorkspaceIds.remove(workspace.id)
+            clearWorkspaceGitProbes(workspaceId: workspace.id)
+            AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: workspace.id)
+            unwireClosedBrowserTracking(for: workspace)
+
+            if let index = tabs.firstIndex(where: { $0.id == workspace.id }) {
+                tabs.remove(at: index)
+                if selectedTabId == workspace.id {
+                    let newIndex = min(index, max(0, tabs.count - 1))
+                    selectedTabId = tabs[newIndex].id
+                }
+            }
+
+            WeaBotService.shared.startBackgroundDigest(
+                sessionKey: sessionKey, groupId: groupId, workspace: workspace
+            )
+        } else {
+            WeaBotService.shared.removeBridge(for: sessionKey)
+            closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
+        }
     }
 
     @discardableResult
