@@ -211,7 +211,18 @@ final class WeaBotService: ObservableObject {
         }
 
         workspaceSessionKeys[panel.workspaceId.uuidString.lowercased()] = sessionKey
-        registry.register(sessionKey: sessionKey, groupId: groupId, displayName: displayName, workspaceId: panel.workspaceId, panelId: panel.id)
+
+        let chatTypeStr: String? = dest.type == .user ? "direct" : "group"
+        registry.register(
+            sessionKey: sessionKey,
+            groupId: groupId,
+            displayName: displayName,
+            workspaceId: panel.workspaceId,
+            panelId: panel.id,
+            chatType: chatTypeStr,
+            destGroupId: dest.groupId,
+            destWuid: dest.wuid
+        )
 
         return WeaTerminalBridge(
             sessionKey: sessionKey,
@@ -260,10 +271,16 @@ final class WeaBotService: ObservableObject {
         if let bridge = bridge(forWorkspaceId: workspaceId) {
             bridge.startTranscriptWatch(path: transcriptPath, sessionId: sessionId)
             storeClaudeSessionId(sessionId, forWorkspaceId: workspaceId)
+            if let sessionId, !sessionId.isEmpty {
+                registry.updateClaudeSessionId(sessionId, for: bridge.sessionKey)
+            }
             return
         }
         for bridge in bridges.values where bridge.isWeaMessageActive {
             bridge.startTranscriptWatch(path: transcriptPath, sessionId: sessionId)
+            if let sessionId, !sessionId.isEmpty {
+                registry.updateClaudeSessionId(sessionId, for: bridge.sessionKey)
+            }
             return
         }
     }
