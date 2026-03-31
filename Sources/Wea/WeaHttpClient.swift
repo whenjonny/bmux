@@ -203,25 +203,26 @@ final class WeaHttpClient {
         return try await sendMessage(payload)
     }
 
-    /// Best-effort resolve group name when inbound payload does not carry `groupName`.
-    /// This tries a few known group-management style endpoints derived from Difft SDK docs.
+    /// Resolve group name via GET /v1/groups/members (the correct Difft OpenAPI endpoint).
+    ///
+    /// Returns the group display name, or nil on failure.
+    /// The response envelope is `{ status: 0, data: { name: "...", members: [...] } }`.
     func fetchGroupName(groupId: String, botId: String) async -> String? {
         let normalizedBotId = botId.hasPrefix("+") ? botId : "+\(botId)"
-        let candidates: [(path: String, query: [String: String])] = [
-            ("/v1/group/getGroupByBotId", ["botID": normalizedBotId]),
-            ("/v1/group/getGroupByBotId", ["botId": normalizedBotId]),
-            ("/v1/group/getGroupMembers", ["botID": normalizedBotId, "groupID": groupId]),
-            ("/v1/group/getGroupMembers", ["botId": normalizedBotId, "groupId": groupId]),
-        ]
+        let path = "/v1/groups/members"
+        let query = ["operator": normalizedBotId, "gid": groupId]
 
-        for candidate in candidates {
-            if let json = try? await sendSignedGet(path: candidate.path, query: candidate.query),
-               let name = extractGroupName(from: json, targetGroupId: groupId) {
-                weaLog("[HTTP] Resolved group name via \(candidate.path): gid=\(groupId) name=\(name)")
-                return name
-            }
+        guard let json = try? await sendSignedGet(path: path, query: query),
+              let dict = json as? [String: Any],
+              let status = dict["status"] as? Int, status == 0,
+              let data = dict["data"] as? [String: Any],
+              let name = data["name"] as? String, !name.isEmpty
+        else {
+            return nil
         }
-        return nil
+
+        weaLog("[HTTP] Resolved group name via \(path): gid=\(groupId) name=\(name)")
+        return name
     }
 
     // MARK: - Private
@@ -368,12 +369,11 @@ final class WeaHttpClient {
     }
 
     private func sendSignedGet(path: String, query: [String: String]) async throws -> Any {
-        let canonical = canonicalQueryString(query)
         let signed = WeaSignature.signGet(
             appId: appId,
             appSecret: appSecret,
             path: path,
-            sortedQuery: canonical
+            query: query
         )
 
         var components = URLComponents(string: "\(baseURL)\(path)")!
@@ -388,7 +388,8 @@ final class WeaHttpClient {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
-        weaLog("[HTTP] GET \(path)?\(canonical)")
+        let queryDesc = query.keys.sorted().map { "\($0)=\(query[$0]!)" }.joined(separator: "&")
+        weaLog("[HTTP] GET \(path)?\(queryDesc)")
         let (data, response) = try await session.data(for: request)
         let respBody = String(data: data, encoding: .utf8) ?? ""
         if let httpResponse = response as? HTTPURLResponse {
@@ -398,69 +399,6 @@ final class WeaHttpClient {
             }
         }
         return try JSONSerialization.jsonObject(with: data)
-    }
-
-    private func canonicalQueryString(_ query: [String: String]) -> String {
-        query.keys.sorted().map { key in
-            let value = query[key] ?? ""
-            return "\(percentEncodeQueryComponent(key))=\(percentEncodeQueryComponent(value))"
-        }.joined(separator: "&")
-    }
-
-    private func percentEncodeQueryComponent(_ value: String) -> String {
-        var allowed = CharacterSet.urlQueryAllowed
-        allowed.remove(charactersIn: "&=?+")
-        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-    }
-
-    private func extractGroupName(from payload: Any, targetGroupId: String) -> String? {
-        if let dict = payload as? [String: Any] {
-            if let direct = extractNameFromGroupObject(dict, targetGroupId: targetGroupId) {
-                return direct
-            }
-            let containerKeys = ["data", "result", "groups", "groupList", "list", "items", "group", "groupMember"]
-            for key in containerKeys {
-                if let child = dict[key], let found = extractGroupName(from: child, targetGroupId: targetGroupId) {
-                    return found
-                }
-            }
-            for value in dict.values {
-                if let found = extractGroupName(from: value, targetGroupId: targetGroupId) {
-                    return found
-                }
-            }
-            return nil
-        }
-        if let array = payload as? [Any] {
-            for item in array {
-                if let found = extractGroupName(from: item, targetGroupId: targetGroupId) {
-                    return found
-                }
-            }
-        }
-        return nil
-    }
-
-    private func extractNameFromGroupObject(_ dict: [String: Any], targetGroupId: String) -> String? {
-        let gid = firstString(in: dict, keys: ["gid", "groupID", "groupId", "groupid", "id"])
-        let name = firstString(in: dict, keys: ["groupName", "name", "group_name", "displayName"])
-        if let gid, gid == targetGroupId, let name, !name.isEmpty {
-            return name
-        }
-        if gid == nil, let name, !name.isEmpty, dict.keys.contains(where: { $0.lowercased().contains("group") }) {
-            return name
-        }
-        return nil
-    }
-
-    private func firstString(in dict: [String: Any], keys: [String]) -> String? {
-        for key in keys {
-            if let value = dict[key] as? String {
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            }
-        }
-        return nil
     }
 
     /// Split text at paragraph/line/word boundaries.

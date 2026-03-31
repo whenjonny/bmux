@@ -86,6 +86,7 @@ final class WeaBotService: ObservableObject {
         cleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.cleanupDeadBridges()
+                self?.healthCheckRegistry()
             }
         }
         debugLog("service.start connecting appId=\(config.appId) botId=\(config.botId)")
@@ -172,7 +173,7 @@ final class WeaBotService: ObservableObject {
                 logger.warning("Pre-service queue overflow — dropped oldest message")
             }
             preServiceQueue.append((payload: payload, receivedAt: Date()))
-            weaLog("[queue.preService] count=\(preServiceQueue.count)")
+            debugLog("[queue.preService] count=\(preServiceQueue.count)")
             return
         }
 
@@ -265,7 +266,7 @@ final class WeaBotService: ObservableObject {
         let cutoff = Date().addingTimeInterval(-Self.rateLimitWindow)
         timestamps.removeAll { $0 < cutoff }
         if timestamps.count >= Self.rateLimitMaxMessages {
-            weaLog("[rateLimit.exceeded] sessionKey=\(sessionKey) count=\(timestamps.count)")
+            debugLog("[rateLimit.exceeded] sessionKey=\(sessionKey) count=\(timestamps.count)")
             Task {
                 try? await httpClient?.sendReply(
                     text: "Rate limited — please wait before sending more messages.",
@@ -397,6 +398,34 @@ final class WeaBotService: ObservableObject {
             messageTimestamps.removeValue(forKey: key)
             registry.markDead(sessionKey: key)
             debugLog("cleanup.bridge sessionKey=\(key) reason=processDeadIdle")
+        }
+    }
+
+    // MARK: - Registry Health Check
+
+    /// Validates that terminals referenced in session-map.json still exist.
+    /// Marks entries dead when their workspace or terminal panel is gone.
+    private func healthCheckRegistry() {
+        let aliveEntries = registry.allAliveEntries
+        guard !aliveEntries.isEmpty else { return }
+
+        for entry in aliveEntries {
+            guard let workspaceUUID = UUID(uuidString: entry.workspaceId) else {
+                registry.markDead(sessionKey: entry.sessionKey)
+                debugLog("healthCheck.markDead sessionKey=\(entry.sessionKey) reason=invalidWorkspaceUUID")
+                continue
+            }
+            guard let workspace = tabManager?.tabs.first(where: { $0.id == workspaceUUID }) else {
+                registry.markDead(sessionKey: entry.sessionKey)
+                debugLog("healthCheck.markDead sessionKey=\(entry.sessionKey) reason=workspaceMissing wsId=\(entry.workspaceId)")
+                continue
+            }
+            guard let panelUUID = UUID(uuidString: entry.panelId),
+                  workspace.panels[panelUUID] is TerminalPanel else {
+                registry.markDead(sessionKey: entry.sessionKey)
+                debugLog("healthCheck.markDead sessionKey=\(entry.sessionKey) reason=panelMissing panelId=\(entry.panelId)")
+                continue
+            }
         }
     }
 

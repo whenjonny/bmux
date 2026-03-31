@@ -117,6 +117,10 @@ final class WeaSessionRegistry {
         return candidates.first?.sessionKey
     }
 
+    var allAliveEntries: [Entry] {
+        entries.values.filter { $0.alive }
+    }
+
     func removeAll() {
         entries.removeAll()
         save()

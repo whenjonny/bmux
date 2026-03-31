@@ -6,7 +6,7 @@ import Foundation
 /// Matches the `@wea/wea-sdk-js` `RequestApi` signing exactly:
 ///
 ///   POST: calcStr = `${appid};${timestamp};${nonce};POST;${path};content-length=${utf8ByteLen},content-type=${contentType};${jsonBody}`
-///   GET:  calcStr = `${appid};${timestamp};${nonce};GET;${path};${sortedQueryParams}`
+///   GET:  calcStr = `${appid};${timestamp};${nonce};GET;${path};${key1=val1,key2=val2;}`
 ///   WS:   calcStr = `${appid};${timestamp};${nonce};GET;/v1/websocket;`
 ///
 ///   signature = HmacSHA256(calcStr, secret).toString()  // hex output
@@ -97,21 +97,33 @@ enum WeaSignature {
 
     /// Sign a GET request to the WEA API.
     ///
-    /// SDK format:
+    /// JS SDK format (getParams in `@wea/wea-sdk-js`):
+    /// - Params sorted by key, comma-separated, with trailing semicolon.
+    /// - Values are NOT percent-encoded in the signature string.
     /// ```
-    /// calcStr = "${appid};${ts};${nonce};GET;${path};${sortedQueryParams}"
+    /// calcStr = "${appid};${ts};${nonce};GET;${path};${key1=val1,key2=val2;}"
     /// ```
-    /// - Parameter sortedQuery: Canonical query string sorted by key (e.g. `a=1&b=2`), or empty string.
+    /// - Parameter query: Dictionary of query parameters (raw values, not percent-encoded).
     static func signGet(
         appId: String,
         appSecret: String,
         path: String,
-        sortedQuery: String = ""
+        query: [String: String] = [:]
     ) -> SignedHeaders {
         let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
         let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
 
-        let calcStr = "\(appId);\(timestamp);\(nonce);GET;\(path);\(sortedQuery)"
+        // JS SDK: sorted keys, comma-separated "key=value", trailing semicolon
+        let paramStr: String
+        if query.isEmpty {
+            paramStr = ""
+        } else {
+            paramStr = query.keys.sorted()
+                .map { "\($0)=\(query[$0]!)" }
+                .joined(separator: ",") + ";"
+        }
+
+        let calcStr = "\(appId);\(timestamp);\(nonce);GET;\(path);\(paramStr)"
         let signature = hmacSHA256(message: calcStr, secret: appSecret)
 
         return SignedHeaders(

@@ -11213,6 +11213,10 @@ struct CMUXCLI {
             if let tp = parsedInput.transcriptPath, !tp.isEmpty {
                 weaSessionStartPayload["transcript_path"] = tp
             }
+            if let sid = parsedInput.sessionId, !sid.isEmpty {
+                weaSessionStartPayload["session_id"] = sid
+            }
+            cliWeaLog("[CLI:session-start] ws=\(workspaceId) sid=\(parsedInput.sessionId ?? "nil") transcript=\(parsedInput.transcriptPath?.suffix(60) ?? "nil")")
             sendWeaHookCommand("wea_session_start", payload: weaSessionStartPayload, client: client)
 
             // Inject journal.md content for WEA sessions so Claude has prior context
