@@ -31,7 +31,7 @@ final class WeaWebSocket: NSObject {
     private var reconnectTimer: Timer?
     private let baseReconnectInterval: TimeInterval = 3.0
     private let maxReconnectInterval: TimeInterval = 60.0
-    private var reconnectAttempt = 0
+    private var reconnectAttempt: Int = 0
     private let pingInterval: TimeInterval = 30.0
     private var intentionalDisconnect = false
 

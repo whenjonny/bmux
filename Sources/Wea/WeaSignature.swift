@@ -95,6 +95,31 @@ enum WeaSignature {
         )
     }
 
+    /// Sign a GET request.
+    ///
+    /// calcStr = "${appid};${ts};${nonce};GET;${path};${sortedQuery}"
+    static func signGet(
+        appId: String,
+        appSecret: String,
+        path: String,
+        sortedQuery: String
+    ) -> SignedHeaders {
+        let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
+        let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+
+        let calcStr = "\(appId);\(timestamp);\(nonce);GET;\(path);\(sortedQuery)"
+        let signature = hmacSHA256(message: calcStr, secret: appSecret)
+
+        return SignedHeaders(
+            appId: appId,
+            timestamp: timestamp,
+            nonce: nonce,
+            algorithm: "HmacSHA256",
+            signature: signature,
+            signedHeaders: ""
+        )
+    }
+
     // MARK: - Private
 
     /// Compute HMAC-SHA256 and return the result as a lowercase hex string.
