@@ -61,6 +61,7 @@ final class WeaBotService: ObservableObject {
         if let tabManager {
             workspaceManager = WeaWorkspaceManager(tabManager: tabManager)
             reconnectRestoredWorkspaces(tabManager: tabManager)
+            proactiveRestore()
         }
 
         httpClient = WeaHttpClient(appId: config.appId, appSecret: secret, botId: config.botId)
@@ -230,6 +231,44 @@ final class WeaBotService: ObservableObject {
             httpClient: httpClient,
             dest: dest
         )
+    }
+
+    // MARK: - Proactive Restore
+
+    private func reconstructDest(from entry: WeaSessionRegistry.Entry) -> WeaMessageDest {
+        if let groupId = entry.destGroupId {
+            return .group(groupId)
+        }
+        if let wuid = entry.destWuid {
+            return .dm(to: wuid)
+        }
+        if entry.sessionKey.hasPrefix("direct:") {
+            return .dm(to: entry.groupId)
+        }
+        return .group(entry.groupId)
+    }
+
+    private func proactiveRestore() {
+        guard let httpClient, let workspaceManager else { return }
+        let cutoff = Date().addingTimeInterval(-24 * 3600)
+        let recentEntries = registry.activeEntries(since: cutoff)
+
+        for entry in recentEntries {
+            guard bridges[entry.sessionKey] == nil else { continue }
+            guard let workspace = workspaceManager.workspace(for: entry.groupId) else { continue }
+            guard let panel = workspace.panels.values.compactMap({ $0 as? TerminalPanel }).first else { continue }
+
+            let dest = reconstructDest(from: entry)
+            let bridge = WeaTerminalBridge(
+                sessionKey: entry.sessionKey,
+                panel: panel,
+                httpClient: httpClient,
+                dest: dest
+            )
+            bridges[entry.sessionKey] = bridge
+            workspaceSessionKeys[workspace.id.uuidString.lowercased()] = entry.sessionKey
+            logger.info("Proactively restored bridge for \(entry.sessionKey) (last active: \(entry.lastMessageAt))")
+        }
     }
 
     // MARK: - Hook Integration
