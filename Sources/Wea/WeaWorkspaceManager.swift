@@ -32,28 +32,41 @@ final class WeaWorkspaceManager {
         return panel.workspaceId == workspace.id
     }
 
+    /// Marker file path for agent liveness tracking.
+    /// Uses the same convention as `WeaTerminalBridge.agentAlivePath`.
+    static func agentAlivePath(for sessionKey: String) -> String {
+        let safe = sessionKey.replacingOccurrences(of: ":", with: "_")
+        return "\(NSTemporaryDirectory())cmux-wea-agent-\(safe)"
+    }
+
     /// Build the shell command to launch Claude in a WEA session.
     /// Since this is sent via sendInput into an already-running login shell,
     /// we just need cd + the launch command (shell already has full PATH).
-    func launchCommand(for groupId: String, claudeSessionId: String? = nil) -> String {
+    /// When `agentAlivePath` is provided, a cleanup suffix is appended so the
+    /// marker file is removed when Claude exits (normal or crash).
+    func launchCommand(for groupId: String, claudeSessionId: String? = nil, agentAlivePath: String? = nil) -> String {
         let folder = WeaBotConfig.shared.sessionFolder(for: groupId)
-        return launchCommand(workingDirectory: folder, claudeSessionId: claudeSessionId)
+        return launchCommand(workingDirectory: folder, claudeSessionId: claudeSessionId, agentAlivePath: agentAlivePath)
     }
 
-    private func launchCommand(workingDirectory: String, claudeSessionId: String? = nil) -> String {
+    private func launchCommand(workingDirectory: String, claudeSessionId: String? = nil, agentAlivePath: String? = nil) -> String {
         let quotedCwd = shellSingleQuote(workingDirectory)
         var cmd = "cd \(quotedCwd) && codemax claude --allow-dangerously-skip-permissions --model=bedrock-claude-4-6-opus"
         if let sessionId = claudeSessionId, !sessionId.isEmpty {
             cmd += " --resume \(shellSingleQuote(sessionId))"
+        }
+        // Clean up the agent-alive marker when Claude exits so liveness detection works.
+        if let path = agentAlivePath {
+            cmd += "; rm -f \(shellSingleQuote(path))"
         }
         return cmd
     }
 
     /// Find or create a workspace for a group/DM session.
     /// Returns the terminal panel for message injection.
-    func findOrCreatePanel(groupId: String, displayName: String, claudeSessionId: String? = nil) -> TerminalPanel? {
+    func findOrCreatePanel(groupId: String, displayName: String, claudeSessionId: String? = nil, agentAlivePath: String? = nil) -> TerminalPanel? {
         let folder = WeaBotConfig.shared.sessionFolder(for: groupId)
-        let command = launchCommand(workingDirectory: folder, claudeSessionId: claudeSessionId)
+        let command = launchCommand(workingDirectory: folder, claudeSessionId: claudeSessionId, agentAlivePath: agentAlivePath)
 
         // Check for existing workspace
         if let existing = workspace(for: groupId) {
@@ -62,7 +75,7 @@ final class WeaWorkspaceManager {
                 // relaunch with --resume using the saved session ID.
                 if !launchedPanelIds.contains(existingPanel.id) {
                     let resumeId = claudeSessionId ?? existing.claudeSessionId
-                    let resumeCmd = launchCommand(workingDirectory: folder, claudeSessionId: resumeId)
+                    let resumeCmd = launchCommand(workingDirectory: folder, claudeSessionId: resumeId, agentAlivePath: agentAlivePath)
                     logger.info("Resuming Claude in restored panel for \(groupId), sessionId=\(resumeId ?? "nil")")
                     launchedPanelIds.insert(existingPanel.id)
                     // Wait for the terminal surface to be live before sending the command.
@@ -87,7 +100,9 @@ final class WeaWorkspaceManager {
                   let newPanel = existing.newTerminalSurface(inPane: paneId, focus: false, workingDirectory: folder) else {
                 return nil
             }
-            newPanel.sendInput(command + "\n")
+            let recreateSessionId = claudeSessionId ?? existing.claudeSessionId
+            let recreateCommand = launchCommand(workingDirectory: folder, claudeSessionId: recreateSessionId, agentAlivePath: agentAlivePath)
+            newPanel.sendInput(recreateCommand + "\n")
             launchedPanelIds.insert(newPanel.id)
             logger.info("Recreated WEA terminal panel for \(groupId) in existing workspace \(existing.id.uuidString)")
             return newPanel

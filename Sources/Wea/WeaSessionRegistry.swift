@@ -9,9 +9,10 @@ final class WeaSessionRegistry {
     struct Entry: Codable {
         let sessionKey: String
         let groupId: String
-        let displayName: String
+        var displayName: String
         var workspaceId: String
         var panelId: String
+        var claudeSessionId: String?
         var alive: Bool
         var lastMessageAt: Date
     }
@@ -32,12 +33,14 @@ final class WeaSessionRegistry {
     // MARK: - Public API
 
     func register(sessionKey: String, groupId: String, displayName: String, workspaceId: UUID, panelId: UUID) {
+        let existingSessionId = entries[sessionKey]?.claudeSessionId
         entries[sessionKey] = Entry(
             sessionKey: sessionKey,
             groupId: groupId,
             displayName: displayName,
             workspaceId: workspaceId.uuidString,
             panelId: panelId.uuidString,
+            claudeSessionId: existingSessionId,
             alive: true,
             lastMessageAt: Date()
         )
@@ -64,8 +67,54 @@ final class WeaSessionRegistry {
         save()
     }
 
+    func updateDisplayName(sessionKey: String, displayName: String) {
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, var entry = entries[sessionKey] else { return }
+        guard entry.displayName != trimmed else { return }
+        entry.displayName = trimmed
+        entries[sessionKey] = entry
+        save()
+    }
+
+    func updateClaudeSessionId(sessionKey: String, sessionId: String) {
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, var entry = entries[sessionKey] else { return }
+        guard entry.claudeSessionId != trimmed else { return }
+        entry.claudeSessionId = trimmed
+        entries[sessionKey] = entry
+        save()
+    }
+
     func entry(for sessionKey: String) -> Entry? {
         entries[sessionKey]
+    }
+
+    func entry(forWorkspaceId workspaceId: UUID) -> Entry? {
+        let normalized = workspaceId.uuidString.lowercased()
+        return entries.values.first { $0.workspaceId.lowercased() == normalized }
+    }
+
+    func entries(forGroupId groupId: String) -> [Entry] {
+        entries.values.filter { $0.groupId == groupId }
+    }
+
+    func preferredSessionKey(groupId: String, workspaceId: UUID? = nil) -> String? {
+        let normalizedWorkspaceId = workspaceId?.uuidString.lowercased()
+        if let normalizedWorkspaceId {
+            if let byWorkspace = entries.values.first(where: { $0.workspaceId.lowercased() == normalizedWorkspaceId }) {
+                return byWorkspace.sessionKey
+            }
+        }
+
+        let candidates = entries.values
+            .filter { $0.groupId == groupId }
+            .sorted {
+                if $0.alive != $1.alive {
+                    return $0.alive && !$1.alive
+                }
+                return $0.lastMessageAt > $1.lastMessageAt
+            }
+        return candidates.first?.sessionKey
     }
 
     func removeAll() {

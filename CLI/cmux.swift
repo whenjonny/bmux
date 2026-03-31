@@ -11214,7 +11214,14 @@ struct CMUXCLI {
                 weaSessionStartPayload["transcript_path"] = tp
             }
             sendWeaHookCommand("wea_session_start", payload: weaSessionStartPayload, client: client)
-            print("OK")
+
+            // Inject journal.md content for WEA sessions so Claude has prior context
+            if hasWeaActiveMarker(), let cwd = parsedInput.cwd,
+               let journal = readJournalForInjection(cwd: cwd) {
+                print(journal)
+            } else {
+                print("OK")
+            }
 
         case "stop", "idle":
             telemetry.breadcrumb("claude-hook.stop")
@@ -11264,6 +11271,15 @@ struct CMUXCLI {
                     if let tp = parsedInput.transcriptPath { weaPayload["transcript_path"] = tp }
                     if let body = completion?.body { weaPayload["last_message"] = body }
                     sendWeaHookCommand("wea_claude_stop", payload: weaPayload, client: client)
+
+                    // Persist conversation context to journal.md for cross-session memory
+                    if let cwd = parsedInput.cwd {
+                        appendWeaJournalEntry(
+                            cwd: cwd,
+                            transcriptPath: parsedInput.transcriptPath,
+                            completion: completion
+                        )
+                    }
                 }
 
                 try? setClaudeStatus(
@@ -12104,6 +12120,130 @@ struct CMUXCLI {
     private func sanitizeNotificationField(_ value: String) -> String {
         return normalizedSingleLine(value)
             .replacingOccurrences(of: "|", with: "¦")
+    }
+
+    // MARK: - WEA Journal Persistence
+
+    /// Read journal.md from the session folder and format for context injection.
+    /// Returns nil if no journal exists or it's empty.
+    private func readJournalForInjection(cwd: String) -> String? {
+        let journalPath = (cwd as NSString).appendingPathComponent("journal.md")
+        guard FileManager.default.fileExists(atPath: journalPath),
+              let content = try? String(contentsOfFile: journalPath, encoding: .utf8) else {
+            return nil
+        }
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // Limit to last ~4000 chars to avoid overwhelming context window
+        let maxChars = 4000
+        let tail: String
+        if trimmed.count > maxChars {
+            tail = "...(earlier entries truncated)\n" + String(trimmed.suffix(maxChars))
+        } else {
+            tail = trimmed
+        }
+        return "<session-journal source=\"journal.md\">\n\(tail)\n</session-journal>"
+    }
+
+    /// Read transcript JSONL and append a structured entry to journal.md.
+    private func appendWeaJournalEntry(
+        cwd: String,
+        transcriptPath: String?,
+        completion: (subtitle: String, body: String)?
+    ) {
+        let journalPath = (cwd as NSString).appendingPathComponent("journal.md")
+
+        // Read transcript for richer context
+        var userMessage: String?
+        var assistantMessage: String?
+        if let tp = transcriptPath {
+            let summary = readTranscriptForJournal(path: tp)
+            userMessage = summary?.lastUserMessage
+            assistantMessage = summary?.lastAssistantMessage
+        }
+
+        // Skip trivial entries with no meaningful content
+        let hasContent = (userMessage != nil) ||
+                         (assistantMessage != nil) ||
+                         (completion?.body != nil && !(completion!.body.isEmpty))
+        guard hasContent else { return }
+
+        // Build journal entry
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm"
+        let ts = df.string(from: Date())
+
+        let topic = completion?.subtitle ?? "Session"
+        var entry = "\n## \(ts) — \(topic)\n"
+
+        if let userMessage {
+            entry += "**Request:** \(truncate(normalizedSingleLine(userMessage), maxLength: 200))\n"
+        }
+        if let assistantMessage {
+            entry += "**Response:** \(truncate(normalizedSingleLine(assistantMessage), maxLength: 500))\n"
+        } else if let body = completion?.body {
+            entry += "**Summary:** \(truncate(normalizedSingleLine(body), maxLength: 300))\n"
+        }
+
+        // Append to journal
+        if let handle = FileHandle(forWritingAtPath: journalPath) {
+            handle.seekToEndOfFile()
+            if let data = entry.data(using: .utf8) {
+                handle.write(data)
+            }
+            handle.closeFile()
+        } else {
+            // Create the file if it doesn't exist
+            try? entry.write(toFile: journalPath, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private struct JournalTranscriptSummary {
+        let lastUserMessage: String?
+        let lastAssistantMessage: String?
+    }
+
+    /// Read transcript JSONL to extract the last user and assistant messages for journal.
+    private func readTranscriptForJournal(path: String) -> JournalTranscriptSummary? {
+        let expandedPath = NSString(string: path).expandingTildeInPath
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: expandedPath)),
+              let content = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        let lines = content.components(separatedBy: "\n")
+        var lastUserMessage: String?
+        var lastAssistantMessage: String?
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let lineData = trimmed.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let message = obj["message"] as? [String: Any],
+                  let role = message["role"] as? String else {
+                continue
+            }
+
+            let text = extractMessageText(from: message)
+            guard let text, !text.isEmpty else { continue }
+
+            switch role {
+            case "user":
+                lastUserMessage = text
+            case "assistant":
+                lastAssistantMessage = text
+            default:
+                break
+            }
+        }
+
+        guard lastUserMessage != nil || lastAssistantMessage != nil else { return nil }
+        return JournalTranscriptSummary(
+            lastUserMessage: lastUserMessage.map { truncate(normalizedSingleLine($0), maxLength: 300) },
+            lastAssistantMessage: lastAssistantMessage.map { truncate(normalizedSingleLine($0), maxLength: 500) }
+        )
     }
 
     // MARK: - Codex hooks

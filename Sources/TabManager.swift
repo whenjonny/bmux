@@ -2731,9 +2731,7 @@ class TabManager: ObservableObject {
             ) else {
                 return false
             }
-            if let groupId = workspace.weaGroupId {
-                WeaBotService.shared.removeBridge(for: "group:\(groupId)")
-            }
+            WeaBotService.shared.removeBridge(forWorkspace: workspace)
             closeWorkspaceIfRunningProcess(workspace, requiresConfirmation: false)
             return true
         }

@@ -95,14 +95,18 @@ enum WeaSignature {
         )
     }
 
-    /// Sign a GET request.
+    /// Sign a GET request to the WEA API.
     ///
-    /// calcStr = "${appid};${ts};${nonce};GET;${path};${sortedQuery}"
+    /// SDK format:
+    /// ```
+    /// calcStr = "${appid};${ts};${nonce};GET;${path};${sortedQueryParams}"
+    /// ```
+    /// - Parameter sortedQuery: Canonical query string sorted by key (e.g. `a=1&b=2`), or empty string.
     static func signGet(
         appId: String,
         appSecret: String,
         path: String,
-        sortedQuery: String
+        sortedQuery: String = ""
     ) -> SignedHeaders {
         let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
         let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()

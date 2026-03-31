@@ -23,6 +23,8 @@ final class WeaBotService: ObservableObject {
     @Published private(set) var state: ServiceState = .stopped
     private var bridges: [String: WeaTerminalBridge] = [:]
     private var workspaceSessionKeys: [String: String] = [:]  // workspace UUID string -> sessionKey
+    private var attemptedGroupNameResolution: Set<String> = []
+    private let debugLogPath = "/tmp/cmux-wea-debug.log"
 
     // B1: Pre-service message queue — buffers messages arriving before .running state
     private var preServiceQueue: [(payload: [String: Any], receivedAt: Date)] = []
@@ -66,8 +68,10 @@ final class WeaBotService: ObservableObject {
     // MARK: - Lifecycle
 
     func start() {
+        debugLog("service.start requested")
         let config = WeaBotConfig.shared
         guard let secret = config.loadSecret(), !config.appId.isEmpty, !config.botId.isEmpty else {
+            debugLog("service.start rejected: config incomplete appIdEmpty=\(config.appId.isEmpty) botIdEmpty=\(config.botId.isEmpty) secretMissing=\(config.loadSecret() == nil)")
             state = .error("WEA bot not configured")
             return
         }
@@ -84,12 +88,14 @@ final class WeaBotService: ObservableObject {
                 self?.cleanupDeadBridges()
             }
         }
+        debugLog("service.start connecting appId=\(config.appId) botId=\(config.botId)")
         webSocket.connect(appId: config.appId, appSecret: secret)
     }
 
     func stop() {
         cleanupTimer?.invalidate()
         cleanupTimer = nil
+        debugLog("service.stop requested bridges=\(bridges.count) mappings=\(workspaceSessionKeys.count)")
         webSocket.disconnect()
         bridges.removeAll()
         workspaceSessionKeys.removeAll()
@@ -107,32 +113,56 @@ final class WeaBotService: ObservableObject {
     /// Pre-populate workspace→sessionKey mappings for WeA workspaces that were restored
     /// from the session snapshot. Bridges are created lazily when the first message arrives.
     private func reconnectRestoredWorkspaces(tabManager: TabManager) {
+        debugLog("restore.begin workspaces=\(tabManager.tabs.count)")
         for workspace in tabManager.tabs {
             guard let groupId = workspace.weaGroupId else { continue }
-            let sessionKey = sessionKey(for: groupId)
+            let sessionKey = sessionKey(for: groupId, workspaceId: workspace.id)
             workspaceSessionKeys[workspace.id.uuidString.lowercased()] = sessionKey
+            if let entry = registry.entry(for: sessionKey),
+               let restoredSessionId = normalizedSessionId(entry.claudeSessionId),
+               normalizedSessionId(workspace.claudeSessionId) == nil {
+                workspace.claudeSessionId = restoredSessionId
+                debugLog("restore.sessionId workspace=\(workspace.id.uuidString) sessionKey=\(sessionKey) sessionId=\(restoredSessionId)")
+            }
+            debugLog("restore.map workspace=\(workspace.id.uuidString) groupId=\(groupId) sessionKey=\(sessionKey)")
             logger.info("Reconnected restored WEA workspace '\(workspace.title)' for \(groupId)")
         }
+        debugLog("restore.end mapped=\(workspaceSessionKeys.count)")
     }
 
     /// Derive a session key from a group ID. Group messages use "group:{id}",
     /// DM sessions use "direct:{wuid}". For restored workspaces where we don't
     /// know the chat type, we inspect the groupId format to determine the key.
-    private func sessionKey(for groupId: String) -> String {
+    private func sessionKey(for groupId: String, workspaceId: UUID? = nil) -> String {
+        if let workspaceId, let workspaceEntry = registry.entry(forWorkspaceId: workspaceId) {
+            debugLog("sessionKey.resolve source=workspaceId workspace=\(workspaceId.uuidString) groupId=\(groupId) sessionKey=\(workspaceEntry.sessionKey)")
+            return workspaceEntry.sessionKey
+        }
+
+        let groupCandidates = registry.entries(forGroupId: groupId)
+            .sorted {
+                if $0.alive != $1.alive {
+                    return $0.alive && !$1.alive
+                }
+                return $0.lastMessageAt > $1.lastMessageAt
+            }
+        if let best = groupCandidates.first {
+            debugLog("sessionKey.resolve source=groupMatch groupId=\(groupId) sessionKey=\(best.sessionKey) alive=\(best.alive) candidates=\(groupCandidates.count)")
+            return best.sessionKey
+        }
         // The groupId stored on the workspace is the raw group/wuid value.
         // During routeDirectMessage we use "direct:{wuid}" and in routeGroupMessage "group:{groupId}".
         // For restored workspaces, check if the registry has an entry to determine the prefix.
         // Fall back to "group:" since that's the most common case.
         if let entry = registry.entry(for: "direct:\(groupId)") {
+            debugLog("sessionKey.resolve source=directFallback groupId=\(groupId) sessionKey=direct:\(entry.groupId)")
             return "direct:\(entry.groupId)"
         }
+        debugLog("sessionKey.resolve source=defaultGroup groupId=\(groupId) sessionKey=group:\(groupId)")
         return "group:\(groupId)"
     }
 
     // MARK: - Message Routing
-
-    /// Messages older than this (in milliseconds) are dropped on reconnect to avoid backlog noise.
-    private static let staleMessageThresholdMs: Int64 = 30_000
 
     private func handleInboundMessage(_ payload: [String: Any]) {
         // B1: Queue messages arriving before service is fully running
@@ -151,17 +181,14 @@ final class WeaBotService: ObservableObject {
         do {
             message = try WeaMessageParser.parse(payload, botId: config.botId)
         } catch {
+            debugLog("message.drop reason=parseError error=\(error.localizedDescription)")
             return
         }
 
-        // Drop stale messages that arrive as backlog on WebSocket reconnect.
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        let ageMs = nowMs - message.timestamp
-        if ageMs > Self.staleMessageThresholdMs {
-            logger.info("Dropping stale WEA message (age=\(ageMs)ms): \(message.text.prefix(40))")
-            return
-        }
-
+        debugLog(
+            "message.inbound id=\(message.messageId) type=\(message.chatType.rawValue) " +
+            "sender=\(message.senderWuid) groupId=\(message.groupId ?? "nil") mention=\(message.isMentionBot)"
+        )
         logger.info("WEA inbound: type=\(message.chatType.rawValue) groupId=\(message.groupId ?? "nil") groupName=\(message.groupName ?? "nil") sender=\(message.senderWuid) mention=\(message.isMentionBot) text=\(message.text.prefix(40))")
 
         switch message.chatType {
@@ -175,6 +202,7 @@ final class WeaBotService: ObservableObject {
     private func routeDirectMessage(_ message: WeaParsedMessage) {
         let sessionKey = "direct:\(message.senderWuid)"
         let displayName = message.senderName ?? "DM"
+        debugLog("route.dm sessionKey=\(sessionKey) displayName=\(displayName) sender=\(message.senderWuid)")
         routeToSession(sessionKey: sessionKey, groupId: message.senderWuid, displayName: displayName, message: message)
     }
 
@@ -183,7 +211,10 @@ final class WeaBotService: ObservableObject {
         let config = WeaBotConfig.shared
 
         guard !config.isBlacklisted(groupId) else { return }
-        guard message.isMentionBot else { return }
+        guard message.isMentionBot else {
+            debugLog("route.group.skip reason=noMention groupId=\(groupId)")
+            return
+        }
 
         // Prefer the group name from the payload, fall back to existing known name.
         if let name = message.groupName, !name.isEmpty {
@@ -193,10 +224,39 @@ final class WeaBotService: ObservableObject {
         let sessionKey = "group:\(groupId)"
         let displayName = config.knownGroups[groupId]
             ?? "Group \(String(groupId.prefix(6)))"
+        syncGroupWorkspaceTitle(groupId: groupId, sessionKey: sessionKey, displayName: displayName)
+        tryResolveGroupNameFromAPIIfNeeded(groupId: groupId, sessionKey: sessionKey)
         let bridgeCount = self.bridges.count
         let hasExisting = self.bridges[sessionKey] != nil
+        debugLog("route.group sessionKey=\(sessionKey) displayName=\(displayName) bridges=\(bridgeCount) existing=\(hasExisting)")
         logger.info("WEA group route: \(sessionKey) → '\(displayName)' (bridges=\(bridgeCount) existing=\(hasExisting))")
         routeToSession(sessionKey: sessionKey, groupId: groupId, displayName: displayName, message: message)
+    }
+
+    private func syncGroupWorkspaceTitle(groupId: String, sessionKey: String, displayName: String) {
+        let resolved = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !resolved.isEmpty else { return }
+        if let workspace = workspaceManager?.workspace(for: groupId),
+           workspace.title != resolved {
+            workspace.title = resolved
+            logger.info("Updated WEA workspace title for \(groupId) -> '\(resolved)'")
+        }
+        registry.updateDisplayName(sessionKey: sessionKey, displayName: resolved)
+    }
+
+    private func tryResolveGroupNameFromAPIIfNeeded(groupId: String, sessionKey: String) {
+        let config = WeaBotConfig.shared
+        if let existing = config.knownGroups[groupId], !existing.isEmpty { return }
+        guard let httpClient else { return }
+        if attemptedGroupNameResolution.contains(groupId) { return }
+        attemptedGroupNameResolution.insert(groupId)
+        let botId = config.botId
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let resolved = await httpClient.fetchGroupName(groupId: groupId, botId: botId) else { return }
+            config.knownGroups[groupId] = resolved
+            self.syncGroupWorkspaceTitle(groupId: groupId, sessionKey: sessionKey, displayName: resolved)
+        }
     }
 
     private func routeToSession(sessionKey: String, groupId: String, displayName: String, message: WeaParsedMessage) {
@@ -221,16 +281,34 @@ final class WeaBotService: ObservableObject {
 
         if let existing = bridges[sessionKey] {
             let panelLive = workspaceManager?.hasLiveTerminalPanel(groupId: groupId, panelId: existing.panelId) == true
-            if panelLive && existing.processAlive {
+            let agentRunning = existing.isAgentRunning
+            let sid = existing.claudeSessionId?.prefix(8) ?? "nil"
+            if panelLive && existing.processAlive && agentRunning {
+                debugLog("bridge.reuse sessionKey=\(sessionKey) sid=\(sid) panel=\(existing.panelId.uuidString) processAlive=1 agentRunning=1")
                 bridge = existing
-            } else if panelLive && !existing.processAlive {
+            } else if panelLive && (!existing.processAlive || !agentRunning) {
                 // Panel exists but Claude died — restart Claude in the same terminal.
-                logger.info("Restarting Claude in existing panel for \(sessionKey)")
-                existing.restartClaude(command: workspaceManager?.launchCommand(for: groupId) ?? "")
+                let reason = !existing.processAlive ? "processExited" : "agentMarkerGone"
+                logger.info("Restarting Claude in existing panel for \(sessionKey) sid=\(sid) reason=\(reason)")
+                debugLog("bridge.restart sessionKey=\(sessionKey) sid=\(sid) panel=\(existing.panelId.uuidString) reason=\(reason)")
+                let sessionId = existing.claudeSessionId
+                    ?? workspaceManager?.workspace(for: groupId)?.claudeSessionId
+                let restartCmd = workspaceManager?.launchCommand(
+                    for: groupId,
+                    claudeSessionId: sessionId,
+                    agentAlivePath: existing.agentAlivePath
+                ) ?? ""
+                existing.restartClaude(command: restartCmd)
+                // Notify WEA chat that agent is restarting.
+                let dest = WeaMessageParser.replyDest(for: message)
+                Task { [weak self] in
+                    try? await self?.httpClient?.sendReply(text: "Restarting agent...", dest: dest)
+                }
                 bridge = existing
             } else {
                 // Panel gone — recreate everything.
-                logger.info("Recreating bridge for \(sessionKey): panelLive=\(panelLive) processAlive=\(existing.processAlive)")
+                logger.info("Recreating bridge for \(sessionKey) sid=\(sid): panelLive=\(panelLive) processAlive=\(existing.processAlive)")
+                debugLog("bridge.recreate sessionKey=\(sessionKey) sid=\(sid) reason=panelMissing panelLive=\(panelLive) processAlive=\(existing.processAlive)")
                 bridges.removeValue(forKey: sessionKey)
                 registry.markDead(sessionKey: sessionKey)
                 if let newBridge = createBridge(sessionKey: sessionKey, groupId: groupId, displayName: displayName, message: message) {
@@ -242,7 +320,9 @@ final class WeaBotService: ObservableObject {
                 }
             }
         } else {
+            debugLog("bridge.create sessionKey=\(sessionKey) reason=newRoute")
             guard let newBridge = createBridge(sessionKey: sessionKey, groupId: groupId, displayName: displayName, message: message) else {
+                debugLog("bridge.create.failed sessionKey=\(sessionKey)")
                 logger.error("Failed to create bridge for session \(sessionKey)")
                 return
             }
@@ -263,13 +343,19 @@ final class WeaBotService: ObservableObject {
 
         // Check if the workspace was restored from a previous session and has a saved Claude session ID.
         let claudeSessionId = workspaceManager.workspace(for: groupId)?.claudeSessionId
+        let alivePath = WeaWorkspaceManager.agentAlivePath(for: sessionKey)
 
-        guard let panel = workspaceManager.findOrCreatePanel(groupId: groupId, displayName: displayName, claudeSessionId: claudeSessionId) else {
+        guard let panel = workspaceManager.findOrCreatePanel(groupId: groupId, displayName: displayName, claudeSessionId: claudeSessionId, agentAlivePath: alivePath) else {
+            debugLog("bridge.panel.failed sessionKey=\(sessionKey) groupId=\(groupId)")
             return nil
         }
 
         workspaceSessionKeys[panel.workspaceId.uuidString.lowercased()] = sessionKey
         registry.register(sessionKey: sessionKey, groupId: groupId, displayName: displayName, workspaceId: panel.workspaceId, panelId: panel.id)
+        debugLog(
+            "bridge.panel.ready sessionKey=\(sessionKey) groupId=\(groupId) " +
+            "workspace=\(panel.workspaceId.uuidString) panel=\(panel.id.uuidString)"
+        )
 
         return WeaTerminalBridge(
             sessionKey: sessionKey,
@@ -458,22 +544,91 @@ final class WeaBotService: ObservableObject {
     }
 
     func handleSessionStart(workspaceId: String, transcriptPath: String?, sessionId: String? = nil) {
+        let resolvedSessionId = resolvedClaudeSessionId(sessionId: sessionId, transcriptPath: transcriptPath)
+        debugLog("hook.sessionStart workspace=\(workspaceId) sid=\(resolvedSessionId?.prefix(8) ?? "nil")")
         if let bridge = bridge(forWorkspaceId: workspaceId) {
-            bridge.startTranscriptWatch(path: transcriptPath, sessionId: sessionId)
-            storeClaudeSessionId(sessionId, forWorkspaceId: workspaceId)
+            bridge.startTranscriptWatch(path: transcriptPath, sessionId: resolvedSessionId)
+            storeClaudeSessionId(resolvedSessionId, forWorkspaceId: workspaceId)
             return
         }
         for bridge in bridges.values where bridge.isWeaMessageActive || bridge.hasPendingStartup {
-            bridge.startTranscriptWatch(path: transcriptPath, sessionId: sessionId)
+            bridge.startTranscriptWatch(path: transcriptPath, sessionId: resolvedSessionId)
             return
         }
     }
 
     private func storeClaudeSessionId(_ sessionId: String?, forWorkspaceId workspaceId: String) {
-        guard let sessionId, !sessionId.isEmpty else { return }
+        guard let sessionId = normalizedSessionId(sessionId) else { return }
         let normalized = workspaceId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard let workspace = tabManager?.tabs.first(where: { $0.id.uuidString.lowercased() == normalized }) else { return }
         workspace.claudeSessionId = sessionId
+        if let groupId = workspace.weaGroupId {
+            let resolvedSessionKey = sessionKey(for: groupId, workspaceId: workspace.id)
+            registry.updateClaudeSessionId(sessionKey: resolvedSessionKey, sessionId: sessionId)
+            debugLog("sessionId.persist workspace=\(workspace.id.uuidString) groupId=\(groupId) sessionId=\(sessionId)")
+        }
+    }
+
+    private func resolvedClaudeSessionId(sessionId: String?, transcriptPath: String?) -> String? {
+        if let trimmed = normalizedSessionId(sessionId), !trimmed.isEmpty {
+            return trimmed
+        }
+        guard let transcriptPath else { return nil }
+        if let inferred = inferSessionId(fromTranscriptPath: transcriptPath) {
+            debugLog("sessionId.infer source=transcript sessionId=\(inferred)")
+            return inferred
+        }
+        return nil
+    }
+
+    private func normalizedSessionId(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func inferSessionId(fromTranscriptPath path: String) -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let content = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        let lines = content
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .suffix(200)
+
+        for line in lines.reversed() {
+            guard let lineData = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: lineData) else {
+                continue
+            }
+            if let inferred = findSessionIdValue(in: object) {
+                return inferred
+            }
+        }
+        return nil
+    }
+
+    private func findSessionIdValue(in object: Any) -> String? {
+        if let dictionary = object as? [String: Any] {
+            for key in ["session_id", "sessionId"] {
+                if let value = normalizedSessionId(dictionary[key] as? String) {
+                    return value
+                }
+            }
+            for value in dictionary.values {
+                if let nested = findSessionIdValue(in: value) {
+                    return nested
+                }
+            }
+        } else if let array = object as? [Any] {
+            for value in array {
+                if let nested = findSessionIdValue(in: value) {
+                    return nested
+                }
+            }
+        }
+        return nil
     }
 
     // MARK: - File Sending
@@ -529,17 +684,27 @@ final class WeaBotService: ObservableObject {
     /// Called by TabManager when a WEA terminal's child process exits.
     func handleChildExited(workspaceId: String) {
         guard let bridge = bridge(forWorkspaceId: workspaceId) else { return }
-        logger.info("Child process exited for session \(bridge.sessionKey)")
+        let sid = bridge.claudeSessionId?.prefix(8) ?? "nil"
+        debugLog("hook.childExited sessionKey=\(bridge.sessionKey) sid=\(sid)")
+        logger.info("Child process exited for session \(bridge.sessionKey) sid=\(sid)")
         bridge.markProcessExited()
         registry.markDead(sessionKey: bridge.sessionKey)
     }
 
     // MARK: - Session Management
 
+    func removeBridge(forWorkspace workspace: Workspace) {
+        guard let groupId = workspace.weaGroupId else { return }
+        let sessionKey = sessionKey(for: groupId, workspaceId: workspace.id)
+        debugLog("bridge.remove.byWorkspace workspace=\(workspace.id.uuidString) groupId=\(groupId) sessionKey=\(sessionKey)")
+        removeBridge(for: sessionKey)
+    }
+
     func removeBridge(for sessionKey: String) {
+        debugLog("bridge.remove sessionKey=\(sessionKey)")
         bridges.removeValue(forKey: sessionKey)
         workspaceSessionKeys = workspaceSessionKeys.filter { $0.value != sessionKey }
-        registry.unregister(sessionKey: sessionKey)
+        registry.markDead(sessionKey: sessionKey)
     }
 
     func bridge(for sessionKey: String) -> WeaTerminalBridge? {
@@ -556,8 +721,22 @@ final class WeaBotService: ObservableObject {
         let normalized = workspaceId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty,
               let sessionKey = workspaceSessionKeys[normalized] else {
+            debugLog("bridge.lookup.miss workspace=\(workspaceId)")
             return nil
         }
+        let sid = bridges[sessionKey]?.claudeSessionId?.prefix(8) ?? "nil"
+        debugLog("bridge.lookup.hit workspace=\(workspaceId) sessionKey=\(sessionKey) sid=\(sid)")
         return bridges[sessionKey]
+    }
+
+    private func debugLog(_ message: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] [WeaBotService] \(message)\n"
+        if let handle = FileHandle(forWritingAtPath: debugLogPath) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            FileManager.default.createFile(atPath: debugLogPath, contents: Data(line.utf8))
+        }
     }
 }

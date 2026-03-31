@@ -11955,10 +11955,10 @@ private struct TabItemView: View, Equatable {
         .disabled(targetIds.isEmpty)
 
         // WEA chat workspace actions
-        if let groupId = tab.weaGroupId {
+        if tab.weaGroupId != nil {
             Divider()
             Button(String(localized: "contextMenu.closeWeaChat", defaultValue: "Close WEA Chat")) {
-                WeaBotService.shared.removeBridge(for: "group:\(groupId)")
+                WeaBotService.shared.removeBridge(forWorkspace: tab)
             }
         }
 

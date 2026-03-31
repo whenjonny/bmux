@@ -23,6 +23,7 @@ final class WeaTerminalBridge {
         case idle
         case processing       // Claude is working on a WEA message
         case waitingInput     // Claude is asking a question
+        case digesting        // Background summarization running
     }
 
     private let logger = Logger(subsystem: "com.cmuxterm.app", category: "WeaTerminalBridge")
@@ -41,7 +42,7 @@ final class WeaTerminalBridge {
     /// Number of messages injected that haven't received a Stop reply yet.
     private var pendingReplyCount = 0
     private var pendingMessages: [String] = []
-    private var replReady = false
+    private(set) var replReady = false
     private var startupTimeoutTask: Task<Void, Never>?
     private let startupTimeoutSeconds: UInt64 = 30
 
@@ -71,6 +72,12 @@ final class WeaTerminalBridge {
     /// Whether the Claude agent process is currently running (marker file exists).
     var isAgentRunning: Bool {
         FileManager.default.fileExists(atPath: agentAlivePath)
+    }
+
+    /// Log prefix including sessionKey and truncated claudeSessionId for easy filtering.
+    private var lp: String {
+        let sid = claudeSessionId.map { " sid=\($0.prefix(8))" } ?? ""
+        return "[Bridge:\(sessionKey)\(sid)]"
     }
 
     init(
@@ -115,7 +122,7 @@ final class WeaTerminalBridge {
         guard !replReady else { return }
         guard !Task.isCancelled else { return }
 
-        weaLog("[Bridge:\(sessionKey)] Claude failed to initialize (no session-start hook after \(startupTimeoutSeconds)s)")
+        weaLog("\(lp) Claude failed to initialize (no session-start hook after \(startupTimeoutSeconds)s)")
         await failPendingStartup()
     }
 
@@ -143,7 +150,7 @@ final class WeaTerminalBridge {
         replReady = true
         startupTimeoutTask?.cancel()
         startupTimeoutTask = nil
-        weaLog("[Bridge:\(sessionKey)] REPL marked as ready, pending=\(pendingMessages.count)")
+        weaLog("\(lp) REPL marked as ready, pending=\(pendingMessages.count)")
 
         // Flush pending messages (queued during startup before REPL was ready)
         guard state != .processing, state != .waitingInput else { return }
@@ -156,90 +163,56 @@ final class WeaTerminalBridge {
     // MARK: - Inject WEA message into terminal
 
     func injectMessage(_ text: String) async {
-        // Queue if Claude process isn't ready yet (startup / relaunch).
+        // Queue only during startup — REPL not ready yet.
         if !replReady {
-            weaLog("[Bridge:\(sessionKey)] REPL not ready, queueing: \(text.prefix(50))")
+            weaLog("\(lp) REPL not ready, queueing: \(text.prefix(50))")
             pendingMessages.append(text)
             return
         }
 
         // Agent marker gone — Claude exited but shell is still alive.
-        // Reset readiness and queue the message; the service will restart Claude.
+        // Reset processing state and queue; the service will restart Claude.
         if !isAgentRunning {
-            weaLog("[Bridge:\(sessionKey)] Agent marker missing, resetting replReady. Queueing: \(text.prefix(50))")
+            weaLog("\(lp) Agent marker missing, resetting. Queueing: \(text.prefix(50))")
+            resetProcessingState()
             replReady = false
             pendingMessages.append(text)
             return
         }
 
-        // Queue if currently processing another message
-        if state == .processing {
-            weaLog("[Bridge:\(sessionKey)] Busy, queueing: \(text.prefix(50))")
-            if pendingMessages.count >= 50 {
-                weaLog("[Bridge:\(sessionKey)] Queue full, dropping oldest")
-                pendingMessages.removeFirst()
-            }
-            pendingMessages.append(text)
-            return
-        }
-
-        // Agent marker gone — Claude exited but shell is still alive.
-        // Reset readiness and queue the message; the service will restart Claude.
-        if !isAgentRunning {
-            weaLog("[Bridge:\(sessionKey)] Agent marker missing, resetting replReady. Queueing: \(text.prefix(50))")
-            replReady = false
-            pendingMessages.append(text)
-            return
-        }
-
-        // Queue if currently processing another message
-        if state == .processing {
-            weaLog("[Bridge:\(sessionKey)] Busy, queueing: \(text.prefix(50))")
-            if pendingMessages.count >= 50 {
-                weaLog("[Bridge:\(sessionKey)] Queue full, dropping oldest")
-                pendingMessages.removeFirst()
-            }
-            pendingMessages.append(text)
-            return
-        }
-
-        // If Claude is waiting for input (permission question), this is a reply
-        // to the current turn — not a new command. Don't increment pendingReplyCount
-        // or create a new thinking card; just forward to terminal.
+        // If Claude is waiting for input (permission question), just forward.
         if state == .waitingInput {
-            weaLog("[Bridge:\(sessionKey)] Injecting reply to question: \(text.prefix(80))")
+            weaLog("\(lp) Injecting reply to question: \(text.prefix(80))")
             state = .processing
             panel.sendInput(text + "\n")
             return
         }
 
         pendingReplyCount += 1
-        weaLog("[Bridge:\(sessionKey)] Injecting (state=\(state), pending=\(pendingReplyCount)): \(text.prefix(80))")
+        weaLog("\(lp) Injecting (state=\(state), pending=\(pendingReplyCount)): \(text.prefix(80))")
 
-        // Always forward to terminal immediately.
+        // Always forward to terminal immediately — no queueing after startup.
         panel.sendInput(text + "\n")
 
-        // Every injected message gets its own thinking card in the FIFO queue.
-        state = .processing
-        writeMarker()
+        // Enter processing state on first message; subsequent messages just stack.
+        if state != .processing {
+            state = .processing
+            writeMarker()
+            startStreamingTimer()
+            startWatchdog()
+        }
 
-        // Start periodic transcript polling and watchdog fallback
-        startStreamingTimer()
-        startWatchdog()
+        // Each message gets its own thinking card for FIFO reply matching.
         do {
             let cardId = try await httpClient.sendCard(
                 content: "⏳ thinking...",
                 dest: dest
             )
             thinkingCardIds.append(cardId)
-            weaLog("[Bridge:\(sessionKey)] Sent thinking card, id=\(cardId)")
+            weaLog("\(lp) Sent thinking card, id=\(cardId)")
         } catch {
-            weaLog("[Bridge:\(sessionKey)] Failed to send thinking card: \(error.localizedDescription)")
+            weaLog("\(lp) Failed to send thinking card: \(error.localizedDescription)")
         }
-
-        // Start periodic transcript polling and watchdog fallback
-        startStreamingTimer()
-        startWatchdog()
     }
 
     // MARK: - Hook Callbacks (called by WeaBotService)
@@ -251,9 +224,15 @@ final class WeaTerminalBridge {
 
         guard state == .processing || state == .waitingInput || state == .digesting else { return }
 
+        // If digesting, just fire the completion — don't send reply to WEA.
+        if state == .digesting {
+            completeDigestIfNeeded()
+            return
+        }
+
         // FIFO mismatch detection
         if thinkingCardIds.isEmpty && pendingReplyCount > 0 {
-            weaLog("[Bridge:\(sessionKey)] Warning: no thinking cards but pendingReplyCount=\(pendingReplyCount)")
+            weaLog("\(lp) Warning: no thinking cards but pendingReplyCount=\(pendingReplyCount)")
         }
 
         pendingReplyCount = max(0, pendingReplyCount - 1)
@@ -266,31 +245,32 @@ final class WeaTerminalBridge {
             content = AssistantContent(text: lastMessage ?? "", images: [])
         }
 
-        weaLog("[Bridge:\(sessionKey)] Claude stopped, text=\(content.text.count) chars, images=\(content.images.count), pending=\(pendingReplyCount), cards=\(thinkingCardIds.count)")
+        weaLog("\(lp) Claude stopped, text=\(content.text.count) chars, images=\(content.images.count), pending=\(pendingReplyCount), cards=\(thinkingCardIds.count)")
 
-        // Send text reply
+        // Send text reply and clean up thinking card.
+        let cardId = thinkingCardIds.isEmpty ? nil : thinkingCardIds.removeFirst()
         if !content.text.isEmpty {
-            let cardId = thinkingCardIds.isEmpty ? nil : thinkingCardIds.removeFirst()
             if let cardId {
                 do {
                     try await httpClient.refreshCard(cardId: cardId, content: content.text, dest: dest)
                 } catch {
-                    weaLog("[Bridge:\(sessionKey)] Refresh failed: \(error.localizedDescription)")
+                    weaLog("\(lp) Refresh failed: \(error.localizedDescription)")
                     try? await httpClient.sendReply(text: content.text, dest: dest)
+                    // Clean up orphaned thinking card so it doesn't stay as "thinking..."
+                    try? await httpClient.refreshCard(cardId: cardId, content: "✓", dest: dest)
                 }
             } else {
-                do {
-                    try await httpClient.sendReply(text: content.text, dest: dest)
-                } catch {
-                    weaLog("[Bridge:\(sessionKey)] Failed to send reply: \(error.localizedDescription)")
-                }
+                try? await httpClient.sendReply(text: content.text, dest: dest)
             }
+        } else if let cardId {
+            // No content but have a thinking card — mark it done.
+            try? await httpClient.refreshCard(cardId: cardId, content: "✓", dest: dest)
         }
 
         // Send images sequentially
         for (i, image) in content.images.enumerated() {
             guard let imageData = Data(base64Encoded: image.base64Data) else {
-                weaLog("[Bridge:\(sessionKey)] Failed to decode base64 image \(i)")
+                weaLog("\(lp) Failed to decode base64 image \(i)")
                 continue
             }
             let ext = image.mediaType.components(separatedBy: "/").last ?? "png"
@@ -302,9 +282,9 @@ final class WeaTerminalBridge {
                     contentType: image.mediaType,
                     dest: dest
                 )
-                weaLog("[Bridge:\(sessionKey)] Sent image \(i + 1)/\(content.images.count): \(fileName) (\(imageData.count)B)")
+                weaLog("\(lp) Sent image \(i + 1)/\(content.images.count): \(fileName) (\(imageData.count)B)")
             } catch {
-                weaLog("[Bridge:\(sessionKey)] Failed to send image \(i + 1): \(error.localizedDescription)")
+                weaLog("\(lp) Failed to send image \(i + 1): \(error.localizedDescription)")
             }
         }
 
@@ -336,21 +316,21 @@ final class WeaTerminalBridge {
     private func refreshOrSendCard(content: String, label: String) async {
         if let cardId = thinkingCardIds.last {
             do {
-                weaLog("[Bridge:\(sessionKey)] Refreshing thinking card for \(label): \(content.prefix(100))")
+                weaLog("\(lp) Refreshing thinking card for \(label): \(content.prefix(100))")
                 try await httpClient.refreshCard(cardId: cardId, content: content, dest: dest)
                 // Remove from queue so the reply creates a new card instead of overwriting this one.
                 thinkingCardIds.removeAll { $0 == cardId }
                 return
             } catch {
-                weaLog("[Bridge:\(sessionKey)] Refresh failed for \(label): \(error.localizedDescription)")
+                weaLog("\(lp) Refresh failed for \(label): \(error.localizedDescription)")
             }
         }
         // Fallback: send as new card
         do {
-            weaLog("[Bridge:\(sessionKey)] Sending \(label) as new card: \(content.prefix(100))")
+            weaLog("\(lp) Sending \(label) as new card: \(content.prefix(100))")
             try await httpClient.sendCard(content: content, dest: dest)
         } catch {
-            weaLog("[Bridge:\(sessionKey)] Failed to send \(label): \(error.localizedDescription)")
+            weaLog("\(lp) Failed to send \(label): \(error.localizedDescription)")
         }
     }
 
@@ -358,7 +338,7 @@ final class WeaTerminalBridge {
     func injectQuestionReply(_ reply: String) {
         guard state == .waitingInput else { return }
         state = .processing
-        weaLog("[Bridge:\(sessionKey)] Injecting reply: '\(reply)'")
+        weaLog("\(lp) Injecting reply: '\(reply)'")
         panel.sendInput(reply + "\n")
     }
 
@@ -366,13 +346,13 @@ final class WeaTerminalBridge {
     func startTranscriptWatch(path: String?, sessionId: String? = nil) {
         if let sessionId, !sessionId.isEmpty {
             claudeSessionId = sessionId
-            weaLog("[Bridge:\(sessionKey)] Claude session ID: \(sessionId)")
+            weaLog("\(lp) Claude session ID: \(sessionId)")
         }
         if let path, !path.isEmpty {
             transcriptPath = path
-            weaLog("[Bridge:\(sessionKey)] Transcript: \(path)")
+            weaLog("\(lp) Transcript: \(path)")
         } else {
-            weaLog("[Bridge:\(sessionKey)] SessionStart received without transcript path")
+            weaLog("\(lp) SessionStart received without transcript path")
         }
         // Mark agent as alive — the launch command suffix removes this on exit.
         FileManager.default.createFile(atPath: agentAlivePath, contents: Data())
@@ -382,48 +362,59 @@ final class WeaTerminalBridge {
 
     // MARK: - Process Liveness
 
-    /// Called when the terminal's child process exits (PTY closed).
-    func markProcessExited() {
+    /// Reset all processing state (timers, watchdog, cards, counters).
+    /// Used when Claude exits, restarts, or agent marker disappears.
+    private func resetProcessingState() {
         streamingTimer?.cancel()
         streamingTimer = nil
         processingWatchdog?.cancel()
         processingWatchdog = nil
+        // Clean up orphaned thinking cards
+        let orphanedCards = thinkingCardIds
+        if !orphanedCards.isEmpty {
+            Task { [weak self] in
+                guard let self else { return }
+                for cardId in orphanedCards {
+                    try? await self.httpClient.refreshCard(cardId: cardId, content: "✓", dest: self.dest)
+                }
+            }
+        }
+        state = .idle
+        activeCardId = nil
+        thinkingCardIds.removeAll()
+        pendingReplyCount = 0
+        lastStreamedLength = 0
+        cleanupMarker()
+    }
+
+    /// Called when the terminal's child process exits (PTY closed).
+    func markProcessExited() {
+        resetProcessingState()
         processAlive = false
         replReady = false
         startupTimeoutTask?.cancel()
         startupTimeoutTask = nil
-        cleanupMarker()
         try? FileManager.default.removeItem(atPath: agentAlivePath)
-        weaLog("[Bridge:\(sessionKey)] Process exited, bridge marked dead")
+        weaLog("\(lp) Process exited, bridge marked dead")
     }
 
     /// Restart Claude in the same terminal panel after process died.
     func restartClaude(command: String) {
         guard !command.isEmpty else { return }
+        resetProcessingState()
         processAlive = true
         replReady = false
         panel.sendInput(command + "\n")
         scheduleStartupTimeout()
-        weaLog("[Bridge:\(sessionKey)] Restarting Claude: \(command.prefix(80))")
+        weaLog("\(lp) Restarting Claude: \(command.prefix(80))")
     }
 
     // MARK: - Finish & Queue
 
     private func finishProcessing() {
-        streamingTimer?.cancel()
-        streamingTimer = nil
-        lastStreamedLength = 0
-        processingWatchdog?.cancel()
-        processingWatchdog = nil
+        resetProcessingState()
 
-        state = .idle
-        activeCardId = nil
-        thinkingCardIds.removeAll()
-        pendingReplyCount = 0
-        cleanupMarker()
-
-        // Process next queued message (from startup or busy queue).
-        // Small delay to let Claude's prompt render before injecting.
+        // Flush startup queue if any messages were waiting.
         if let next = pendingMessages.first {
             pendingMessages.removeFirst()
             Task {
@@ -439,6 +430,7 @@ final class WeaTerminalBridge {
         streamingTimer = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 5_000_000_000) // 5s
+                guard !Task.isCancelled else { break }
                 guard let self, self.state == .processing else { break }
                 await self.streamUpdate()
             }
@@ -454,7 +446,7 @@ final class WeaTerminalBridge {
             if !cardId.isEmpty {
                 try? await httpClient.refreshCard(cardId: cardId, content: content.text, dest: dest)
             }
-            weaLog("[Bridge:\(sessionKey)] Stream update: \(content.text.count) chars")
+            weaLog("\(lp) Stream update: \(content.text.count) chars")
         }
     }
 
@@ -464,6 +456,7 @@ final class WeaTerminalBridge {
         processingWatchdog?.cancel()
         processingWatchdog = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000_000) // 5 minutes
+            guard !Task.isCancelled else { return }
             guard let self, self.state == .processing else { return }
             await self.handleWatchdogFired()
         }
@@ -471,7 +464,7 @@ final class WeaTerminalBridge {
 
     private func handleWatchdogFired() async {
         if !processAlive {
-            weaLog("[Bridge:\(sessionKey)] Watchdog: process dead, recovering")
+            weaLog("\(lp) Watchdog: process dead, recovering")
             if let path = transcriptPath, let content = readLastAssistantContent(from: path), !content.isEmpty {
                 try? await httpClient.sendReply(text: content.text, dest: dest)
             } else {
@@ -479,18 +472,78 @@ final class WeaTerminalBridge {
             }
             finishProcessing()
         } else {
-            weaLog("[Bridge:\(sessionKey)] Watchdog: still alive, resetting")
-            await refreshOrSendCard(content: "Still processing, please wait...", label: "watchdog")
-            startWatchdog() // reset for another 5 min
+            // Check if transcript has content that stopped growing — likely missed Stop hook.
+            // The streaming timer updates lastStreamedLength every 5s, so by the 5-min watchdog
+            // fire it will have caught up. If both are >0 and equal, Claude finished outputting.
+            let currentContent = transcriptPath.flatMap { readLastAssistantContent(from: $0) }
+            let currentLength = currentContent?.text.count ?? 0
+
+            if currentLength > 0 && currentLength == lastStreamedLength {
+                weaLog("\(lp) Watchdog: transcript stale (\(currentLength) chars), recovering as missed Stop")
+                if let content = currentContent, !content.text.isEmpty {
+                    let cardId = thinkingCardIds.isEmpty ? nil : thinkingCardIds.removeFirst()
+                    if let cardId {
+                        do {
+                            try await httpClient.refreshCard(cardId: cardId, content: content.text, dest: dest)
+                        } catch {
+                            try? await httpClient.sendReply(text: content.text, dest: dest)
+                        }
+                    } else {
+                        try? await httpClient.sendReply(text: content.text, dest: dest)
+                    }
+                }
+                finishProcessing()
+            } else {
+                weaLog("\(lp) Watchdog: still alive, resetting (transcript=\(currentLength) streamed=\(lastStreamedLength))")
+                await refreshOrSendCard(content: "Still processing, please wait...", label: "watchdog")
+                startWatchdog() // reset for another 5 min
+            }
         }
     }
 
     /// Mark bridge as stale — called by WeaBotService for dead session cleanup.
     func markStale() {
-        weaLog("[Bridge:\(sessionKey)] Marked stale by service")
+        weaLog("\(lp) Marked stale by service")
         processingWatchdog?.cancel()
         streamingTimer?.cancel()
         finishProcessing()
+    }
+
+    // MARK: - Digest / Summarization
+
+    private var digestCompletion: (() -> Void)?
+
+    /// Inject a summarization prompt into the terminal and transition to `.digesting` state.
+    /// The `onComplete` callback fires when `onClaudeStop` is received while in `.digesting` state.
+    func injectSummarizationPrompt(onComplete: @escaping () -> Void) async {
+        guard replReady, processAlive else {
+            onComplete()
+            return
+        }
+        state = .digesting
+        digestCompletion = onComplete
+        let prompt = "/compact Summarize this session: key decisions, files changed, and outcomes."
+        panel.sendInput(prompt + "\n")
+        weaLog("\(lp) Digest prompt injected")
+    }
+
+    /// Force-finish a digest that hasn't completed within the timeout.
+    func forceFinishDigest() {
+        guard state == .digesting else { return }
+        weaLog("\(lp) Force finishing digest")
+        let completion = digestCompletion
+        digestCompletion = nil
+        finishProcessing()
+        completion?()
+    }
+
+    /// Called from `onClaudeStop` when state is `.digesting` to fire the completion handler.
+    func completeDigestIfNeeded() {
+        guard state == .digesting else { return }
+        let completion = digestCompletion
+        digestCompletion = nil
+        finishProcessing()
+        completion?()
     }
 
     // MARK: - Read full assistant message from transcript
