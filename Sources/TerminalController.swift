@@ -1987,6 +1987,8 @@ class TerminalController {
                 return weaAskQuestion(args)
             case "wea_send_file":
                 return weaSendFile(args)
+            case "wea_summarize":
+                return weaSummarize(args)
 
             default:
                 return "ERROR: Unknown command '\(cmd)'. Use 'help' for available commands."
@@ -2091,6 +2093,21 @@ class TerminalController {
             }
         }
         return "OK"
+    }
+
+    private func weaSummarize(_ args: String?) -> String {
+        guard let args, !args.isEmpty,
+              let data = args.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let workspaceId = json["workspace_id"] as? String else {
+            return "ERR missing workspace_id"
+        }
+
+        let started = WeaBotService.shared.triggerDigest(forWorkspaceId: workspaceId) {
+            // Digest-only mode — workspace stays open
+        }
+
+        return started ? "OK digest_started" : "ERR claude_not_available"
     }
 
     // MARK: - V2 JSON Socket Protocol
