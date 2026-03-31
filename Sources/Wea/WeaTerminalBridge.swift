@@ -183,6 +183,26 @@ final class WeaTerminalBridge {
             return
         }
 
+        // Agent marker gone — Claude exited but shell is still alive.
+        // Reset readiness and queue the message; the service will restart Claude.
+        if !isAgentRunning {
+            weaLog("[Bridge:\(sessionKey)] Agent marker missing, resetting replReady. Queueing: \(text.prefix(50))")
+            replReady = false
+            pendingMessages.append(text)
+            return
+        }
+
+        // Queue if currently processing another message
+        if state == .processing {
+            weaLog("[Bridge:\(sessionKey)] Busy, queueing: \(text.prefix(50))")
+            if pendingMessages.count >= 50 {
+                weaLog("[Bridge:\(sessionKey)] Queue full, dropping oldest")
+                pendingMessages.removeFirst()
+            }
+            pendingMessages.append(text)
+            return
+        }
+
         // If Claude is waiting for input (permission question), this is a reply
         // to the current turn — not a new command. Don't increment pendingReplyCount
         // or create a new thinking card; just forward to terminal.
@@ -203,6 +223,9 @@ final class WeaTerminalBridge {
         state = .processing
         writeMarker()
 
+        // Start periodic transcript polling and watchdog fallback
+        startStreamingTimer()
+        startWatchdog()
         do {
             let cardId = try await httpClient.sendCard(
                 content: "⏳ thinking...",
@@ -226,7 +249,7 @@ final class WeaTerminalBridge {
         processingWatchdog?.cancel()
         processingWatchdog = nil
 
-        guard state == .processing || state == .waitingInput else { return }
+        guard state == .processing || state == .waitingInput || state == .digesting else { return }
 
         // FIFO mismatch detection
         if thinkingCardIds.isEmpty && pendingReplyCount > 0 {
@@ -399,7 +422,8 @@ final class WeaTerminalBridge {
         pendingReplyCount = 0
         cleanupMarker()
 
-        // Process next queued message (from startup or busy queue)
+        // Process next queued message (from startup or busy queue).
+        // Small delay to let Claude's prompt render before injecting.
         if let next = pendingMessages.first {
             pendingMessages.removeFirst()
             Task {
